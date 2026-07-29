@@ -1,0 +1,29 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ Caddy — reverse-proxy перед n8n. Автоматический TLS от Let's Encrypt      ║
+# ║ на основании DOMAIN из docker-compose .env (Caddy читает {$DOMAIN}).      ║
+# ║                                                                            ║
+# ║ Для получения сертификата Caddy делает HTTP-01 challenge, поэтому:        ║
+# ║   • DNS A-запись DOMAIN → публичный IP VPS должна уже существовать         ║
+# ║   • порты 80 и 443 открыты в фаерволе (в docker-compose проброшены)       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+{$DOMAIN} {
+	encode gzip
+
+	# Разумные значения для webhook'ов: n8n отвечает быстро (только приём),
+	# сам workflow может исполняться минуты в фоне — не блокирует прокси.
+	reverse_proxy n8n:5678 {
+		# Прокидываем реальный IP клиента, чтобы n8n видел его вместо IP Caddy.
+		# n8n читает X-Forwarded-For благодаря N8N_PROXY_HOPS=1.
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# Небезопасные заголовки. HSTS включается автоматически Caddy'ем.
+	header {
+		X-Frame-Options "SAMEORIGIN"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+}

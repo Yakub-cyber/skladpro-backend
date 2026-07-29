@@ -1,0 +1,39 @@
+{
+  "name": "SkladPro Support — Approve/Reject",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": ["callback_query"],
+        "additionalFields": {}
+      },
+      "id": "1",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [200, 300],
+      "webhookId": "skladpro-approve-cb"
+    },
+    {
+      "parameters": {
+        "language": "javaScript",
+        "jsCode": "const crypto = require('crypto');\nconst https = require('node:https');\nconst http_ = require('node:http');\nconst { URL } = require('node:url');\n\nfunction fetch(url, opts = {}) {\n  const u = new URL(url);\n  const isHttps = u.protocol === 'https:';\n  const bodyStr = opts.body != null ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : null;\n  const headers = Object.assign({}, opts.headers || {});\n  if (bodyStr != null) headers['content-length'] = Buffer.byteLength(bodyStr);\n  const options = {\n    method: opts.method || 'GET',\n    hostname: u.hostname,\n    port: u.port || (isHttps ? 443 : 80),\n    path: u.pathname + u.search,\n    headers,\n  };\n  return new Promise((resolve, reject) => {\n    const req = (isHttps ? https : http_).request(options, res => {\n      const chunks = [];\n      res.on('data', c => chunks.push(c));\n      res.on('end', () => {\n        const text = Buffer.concat(chunks).toString('utf8');\n        resolve({\n          ok: res.statusCode >= 200 && res.statusCode < 300,\n          status: res.statusCode,\n          headers: res.headers,\n          text: async () => text,\n          json: async () => JSON.parse(text),\n        });\n      });\n    });\n    req.on('error', reject);\n    if (bodyStr != null) req.write(bodyStr);\n    req.end();\n  });\n}\n\nconst update = $input.first().json;\nconst cb = update.callback_query;\nif (!cb) throw new Error('Not a callback_query');\n\nconst allowedChat = String($env.TELEGRAM_CHAT_ID);\nif (String(cb.message?.chat?.id) !== allowedChat) throw new Error('Wrong chat');\n\nconst [action, ticketId, prNumber] = (cb.data || '').split(':');\nif (!['approve', 'reject'].includes(action) || !ticketId || !prNumber)\n  throw new Error('Bad callback_data');\n\nconst repo = ($env.TARGET_REPO ?? $env.SKLADPRO_REPO);\nconst apiUrl = (($env.BACKEND_API_URL ?? $env.SKLADPRO_API_URL) || '').replace(/\\/+$/, '');\nconst secret = ($env.AI_SUPPORT_HMAC_SECRET ?? $env.WEBHOOK_SECRET);\nconst botToken = $env.TELEGRAM_BOT_TOKEN;\n\nconst gh = async (method, path, json) => {\n  const res = await fetch(`https://api.github.com${path}`, {\n    method,\n    headers: {\n      Authorization: `Bearer ${$env.GITHUB_PAT}`,\n      Accept: 'application/vnd.github+json',\n      'X-GitHub-Api-Version': '2022-11-28',\n      'User-Agent': 'ai-support-bot',\n      ...(json ? { 'content-type': 'application/json' } : {}),\n    },\n    body: json ? JSON.stringify(json) : undefined,\n  });\n  if (!res.ok && res.status !== 204 && res.status !== 405) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0,300)}`);\n  return res.status === 204 ? null : res.json();\n};\n\nasync function patchTicket(patchBody) {\n  const body = JSON.stringify(patchBody);\n  const ts = Math.floor(Date.now() / 1000);\n  const sig = 'sha256=' + crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');\n  try {\n    await fetch(`${apiUrl}/v1/support/tickets/${encodeURIComponent(ticketId)}`, {\n      method: 'PATCH',\n      headers: {\n        'content-type': 'application/json',\n        'x-signature-timestamp': String(ts),\n        'x-signature': sig,\n      },\n      body,\n    });\n  } catch (_) {}\n}\n\nasync function tg(method, body) {\n  const r = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify(body),\n  });\n  if (!r.ok) throw new Error(`Telegram ${method}: ${r.status} ${(await r.text()).slice(0,300)}`);\n  return r.json();\n}\n\nlet resultText;\nlet resultStatus;\nif (action === 'approve') {\n  try {\n    await gh('PUT', `/repos/${repo}/pulls/${prNumber}/merge`, { merge_method: 'squash' });\n    resultStatus = 'merged';\n    resultText = `✅ <b>Одобрено и смержено</b> — PR #${prNumber} влит в main.`;\n  } catch (err) {\n    resultStatus = 'failed';\n    resultText = `⚠️ Не удалось смержить PR #${prNumber}: ${err.message}`;\n  }\n} else {\n  try {\n    const pr = await gh('GET', `/repos/${repo}/pulls/${prNumber}`);\n    await gh('PATCH', `/repos/${repo}/pulls/${prNumber}`, { state: 'closed' });\n    try { await gh('DELETE', `/repos/${repo}/git/refs/heads/${pr.head.ref}`); } catch (_) {}\n    resultStatus = 'rejected';\n    resultText = `❌ <b>Отклонено</b> — PR #${prNumber} закрыт, ветка удалена.`;\n  } catch (err) {\n    resultStatus = 'failed';\n    resultText = `⚠️ Не удалось закрыть PR #${prNumber}: ${err.message}`;\n  }\n}\n\nawait patchTicket({ status: resultStatus });\nawait tg('answerCallbackQuery', { callback_query_id: cb.id, text: 'OK' });\n\nconst originalText = cb.message.text || '';\nawait tg('editMessageText', {\n  chat_id: cb.message.chat.id,\n  message_id: cb.message.message_id,\n  parse_mode: 'HTML',\n  text: originalText + `\\n\\n———\\n${resultText}`,\n  reply_markup: { inline_keyboard: [] },\n});\n\nreturn [{ json: { ticketId, prNumber, action, resultStatus } }];"
+      },
+      "id": "2",
+      "name": "Process Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [[{ "node": "Process Callback", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "ai-support"
+  }
+}

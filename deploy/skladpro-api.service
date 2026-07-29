@@ -1,0 +1,28 @@
+# systemd-юнит API-сервера. Установка:
+#   sudo cp deploy/skladpro-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now skladpro-api
+[Unit]
+Description=SkladPro API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skladpro
+Group=skladpro
+WorkingDirectory=/opt/skladpro-backend
+# .env лежит рядом (права 600, владелец skladpro) — dotenv подхватит сам.
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=3
+# Защита процесса
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/skladpro-backend
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

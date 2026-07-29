@@ -1,0 +1,102 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ n8n на VPS для AI-суппорта SkladPro. Три сервиса:                          ║
+# ║   • postgres — БД n8n (workflows, credentials, executions).                ║
+# ║     Отдельная от skladpro-backend БД: изоляция контейнера/бэкапов,          ║
+# ║     n8n не должен видеть данные клиентов.                                  ║
+# ║   • n8n — сам движок workflow.                                             ║
+# ║   • caddy — reverse-proxy с автоматическим TLS от Let's Encrypt.           ║
+# ║                                                                            ║
+# ║ Все секреты — в .env рядом (см. .env.example).                             ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # Только внутренняя сеть; наружу порт не пробрасываем.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:1.72.0
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # ── Домен и URL ──────────────────────────────────────────────────
+      # DOMAIN — тот, что мы прописываем в Caddyfile и в DNS A-записи.
+      N8N_HOST: ${DOMAIN}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      # WEBHOOK_URL — базовый URL для полей типа "Production URL" в вебхуках.
+      # Обязателен когда n8n за прокси и хочет корректно строить URL'ы.
+      WEBHOOK_URL: https://${DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${DOMAIN}/
+
+      # ── БД ───────────────────────────────────────────────────────────
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      # ── Шифрование credentials в БД ──────────────────────────────────
+      # Без этого ключа credentials хранились бы в открытом виде.
+      # Ключ ОБЯЗАТЕЛЬНО одинаковый между рестартами — иначе прошлые
+      # credentials станут нечитаемыми.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      # ── Часовой пояс ─────────────────────────────────────────────────
+      TZ: Europe/Moscow
+      GENERIC_TIMEZONE: Europe/Moscow
+
+      # ── Секьюрити ────────────────────────────────────────────────────
+      # Прокси-мод: n8n доверяет заголовку X-Forwarded-For от Caddy.
+      # Без этого rate-limit и логи будут показывать IP прокси, а не клиента.
+      N8N_PROXY_HOPS: 1
+      # Явно закрываем n8n API от анонимного доступа (owner setup при первом
+      # входе всё равно нужен, но флаг гарантирует что дефолт не сломается
+      # в новых версиях).
+      N8N_USER_MANAGEMENT_DISABLED: 'false'
+
+      # ── Ротация executions ───────────────────────────────────────────
+      # Держим 30 дней истории запусков (диагностика), потом чистим,
+      # чтобы БД не пухла.
+      EXECUTIONS_DATA_PRUNE: 'true'
+      EXECUTIONS_DATA_MAX_AGE: 720   # часов = 30 дней
+
+    volumes:
+      - n8n-data:/home/node/.n8n
+    # Порт наружу не пробрасываем — только через Caddy.
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"     # для HTTP-01 challenge Let's Encrypt
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data     # тут Let's Encrypt хранит сертификаты
+      - caddy-config:/config
+    depends_on:
+      - n8n
+
+volumes:
+  postgres-data:
+  n8n-data:
+  caddy-data:
+  caddy-config:

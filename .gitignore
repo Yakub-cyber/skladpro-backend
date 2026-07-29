@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+coverage/
+e2e-server*.log
+
+# Ключи и секреты — НИКОГДА не коммитить
+credentials/
+!credentials/.gitkeep
+*.pem
+*.key
+firebase-admin*.json
