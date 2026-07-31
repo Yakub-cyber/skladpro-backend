@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
 import { Errors } from '../lib/errors.js'
-import { fromRequest, logSecurityEvent } from '../lib/security-log.js'
+import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 
 const PinSetBody = z.object({
 	employeeId: z.string().min(1).max(64),

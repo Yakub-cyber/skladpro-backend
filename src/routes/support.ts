@@ -4,7 +4,7 @@ import { z } from 'zod'
 import type { Config } from '../config.js'
 import type { DbPool } from '../db.js'
 import { Errors } from '../lib/errors.js'
-import { publishEvent } from '../lib/events.js'
+import { publishEvent } from '../services/events.js'
 import type { SupportTicketRow } from '../schemas/support.js'
 import { SupportTicketBody, SupportTicketPatch } from '../schemas/support.js'
 

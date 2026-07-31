@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
-import { createMetrics } from '../src/lib/metrics.js'
+import { createMetrics } from '../src/services/metrics.js'
 import { authHeaders, baseHandler, makeFakePool, testConfig } from './helpers.js'
 
 describe('GET /metrics', () => {

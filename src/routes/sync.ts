@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
 import { ApiError, Errors } from '../lib/errors.js'
-import { checkLimit, type LimitFeature } from '../lib/subscription.js'
+import { checkLimit, type LimitFeature } from '../services/subscription.js'
 
 /**
  * Синхронизация offline-first клиентов.

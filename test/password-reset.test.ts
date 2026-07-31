@@ -2,7 +2,7 @@ import bcrypt from 'bcryptjs'
 import { createHash } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
-import type { Mailer } from '../src/lib/mailer.js'
+import type { Mailer } from '../src/services/mailer.js'
 import { makeFakePool, testConfig, USER_ID } from './helpers.js'
 
 const passwordHash = bcrypt.hashSync('old-password-1', 4)

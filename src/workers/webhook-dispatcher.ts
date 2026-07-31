@@ -1,8 +1,8 @@
 import { createHmac } from 'node:crypto'
 import type { DbPool } from '../db.js'
-import type { EventBus, SkladEvent } from './events.js'
-import type { Metrics } from './metrics.js'
-import { fromRequest, logSecurityEvent } from './security-log.js'
+import type { EventBus, SkladEvent } from '../services/events.js'
+import type { Metrics } from '../services/metrics.js'
+import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 
 /**
  * Диспатчер исходящих webhook'ов.

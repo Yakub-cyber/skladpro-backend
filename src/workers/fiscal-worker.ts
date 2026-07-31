@@ -1,8 +1,8 @@
 import type { Config } from '../config.js'
 import type { DbPool } from '../db.js'
-import { decryptSecret } from './crypto-aes.js'
-import { publishEvent } from './events.js'
-import { makeAtolClient, type AtolClient, type AtolConfig } from './fiscal/atol.js'
+import { decryptSecret } from '../lib/crypto-aes.js'
+import { publishEvent } from '../services/events.js'
+import { makeAtolClient, type AtolClient, type AtolConfig } from '../services/fiscal/atol.js'
 
 /**
  * Fiscal worker — раз в 30 секунд забирает fiscal_receipts со status='processing'

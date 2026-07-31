@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
-import type { EventBus, EventListener, SkladEvent } from '../src/lib/events.js'
+import type { EventBus, EventListener, SkladEvent } from '../src/services/events.js'
 import { authHeaders, baseHandler, COMPANY_ID, makeFakePool, testConfig, tokens, USER_ID } from './helpers.js'
 
 // Мок EventBus: subscribe возвращает диспетчер, который тест дёргает вручную.
@@ -54,7 +54,7 @@ describe('GET /v1/events (SSE)', () => {
 describe('publishEvent (unit)', () => {
 	it('вызывает select pg_notify с корректным payload', async () => {
 		const { pool, log } = makeFakePool(() => [])
-		const { publishEvent } = await import('../src/lib/events.js')
+		const { publishEvent } = await import('../src/services/events.js')
 		await publishEvent(pool, { companyId: COMPANY_ID, type: 'sale', id: 'o-42' })
 		const call = log.find(e => e.sql.startsWith('select pg_notify'))
 		expect(call).toBeTruthy()
@@ -66,7 +66,7 @@ describe('publishEvent (unit)', () => {
 
 	it('глотает ошибки — публикация best-effort', async () => {
 		const { pool } = makeFakePool(() => { throw new Error('pg down') })
-		const { publishEvent } = await import('../src/lib/events.js')
+		const { publishEvent } = await import('../src/services/events.js')
 		// Не должно throw — иначе бизнес-эндпоинт бы упал из-за упавшего realtime.
 		await expect(publishEvent(pool, { companyId: COMPANY_ID, type: 'sale', id: 'x' }))
 			.resolves.toBeUndefined()

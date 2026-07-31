@@ -1,6 +1,6 @@
 import type { DbPool } from '../db.js'
-import type { EventBus, SkladEvent } from './events.js'
-import type { Fcm } from './fcm.js'
+import type { EventBus, SkladEvent } from '../services/events.js'
+import type { Fcm } from '../services/fcm.js'
 
 /**
  * Push-воркер:

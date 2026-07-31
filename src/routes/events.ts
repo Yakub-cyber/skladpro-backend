@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
-import type { EventBus } from '../lib/events.js'
+import type { EventBus } from '../services/events.js'
 import { Errors } from '../lib/errors.js'
 
 /**

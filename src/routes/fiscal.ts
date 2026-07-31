@@ -5,7 +5,7 @@ import type { Config } from '../config.js'
 import { withTransaction, type DbPool } from '../db.js'
 import { decryptSecret, encryptSecret } from '../lib/crypto-aes.js'
 import { ApiError, Errors } from '../lib/errors.js'
-import { makeAtolClient, type AtolClient, type AtolConfig } from '../lib/fiscal/atol.js'
+import { makeAtolClient, type AtolClient, type AtolConfig } from '../services/fiscal/atol.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
 
 /**

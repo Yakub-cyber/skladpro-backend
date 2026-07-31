@@ -5,9 +5,9 @@ import type { Config } from '../config.js'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
 import { Errors } from '../lib/errors.js'
-import type { Mailer } from '../lib/mailer.js'
+import type { Mailer } from '../services/mailer.js'
 import { hashPassword, verifyPassword } from '../lib/passwords.js'
-import { fromRequest, logSecurityEvent } from '../lib/security-log.js'
+import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 import { hashRefreshToken, type TokenService } from '../lib/tokens.js'
 
 const RegisterBody = z.object({

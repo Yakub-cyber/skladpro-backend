@@ -1,5 +1,5 @@
 import type { DbPool } from '../db.js'
-import { Errors } from './errors.js'
+import { Errors } from '../lib/errors.js'
 import type { Metrics } from './metrics.js'
 
 // Модульный ref на счётчик 402. Инициализируется из buildApp

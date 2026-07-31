@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { bindSecurityMetrics, fromRequest, logSecurityEvent } from '../src/lib/security-log.js'
+import { bindSecurityMetrics, fromRequest, logSecurityEvent } from '../src/services/security-log.js'
 import { authHeaders, makeTestApp, USER_ID } from './helpers.js'
 import { makeFakePool } from './helpers.js'
 

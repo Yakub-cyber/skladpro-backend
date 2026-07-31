@@ -1,8 +1,8 @@
 import { createHash, createHmac } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
-import { createMetrics } from '../src/lib/metrics.js'
-import { startWebhookDispatcher } from '../src/lib/webhook-dispatcher.js'
+import { createMetrics } from '../src/services/metrics.js'
+import { startWebhookDispatcher } from '../src/workers/webhook-dispatcher.js'
 import { authHeaders, baseHandler, COMPANY_ID, makeFakePool, makeTestApp, testConfig } from './helpers.js'
 
 describe('POST /v1/api-keys', () => {
@@ -241,7 +241,7 @@ describe('webhook-dispatcher', () => {
 		})
 		const eventBus = { subscribe: async () => () => {}, close: async () => {} }
 		// bind metrics для этого dispatcher'а
-		const { bindWebhookMetrics } = await import('../src/lib/webhook-dispatcher.js')
+		const { bindWebhookMetrics } = await import('../src/workers/webhook-dispatcher.js')
 		bindWebhookMetrics(metrics)
 		const wd = startWebhookDispatcher({ pool, eventBus, pollIntervalMs: 60_000, fetchImpl: mockFetch as never })
 		await wd.deliverBatch()

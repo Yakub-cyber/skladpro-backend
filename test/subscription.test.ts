@@ -7,7 +7,7 @@ import {
 	PLAN_LIMITS,
 	trialDaysLeft,
 	type Subscription,
-} from '../src/lib/subscription.js'
+} from '../src/services/subscription.js'
 import { authHeaders, baseHandler, COMPANY_ID, makeFakePool, makeTestApp, testConfig } from './helpers.js'
 
 // Кеш подписок — модульная переменная в src/lib/subscription.ts. Между

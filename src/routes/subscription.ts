@@ -5,7 +5,7 @@ import type { Config } from '../config.js'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
 import { Errors } from '../lib/errors.js'
-import { fromRequest, logSecurityEvent } from '../lib/security-log.js'
+import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 import {
 	effectivePlan,
 	extendPaidUntil,
@@ -14,8 +14,8 @@ import {
 	PLAN_LIMITS,
 	trialDaysLeft,
 	type Plan,
-} from '../lib/subscription.js'
-import { makeYooKassa, PLAN_PRICES_RUB, type YooKassaClient } from '../lib/yookassa.js'
+} from '../services/subscription.js'
+import { makeYooKassa, PLAN_PRICES_RUB, type YooKassaClient } from '../services/yookassa.js'
 
 const CheckoutBody = z.object({
 	plan: z.enum(['start', 'business', 'pro']),

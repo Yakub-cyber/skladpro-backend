@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { buildApp } from '../src/app.js'
 import { encryptSecret, decryptSecret } from '../src/lib/crypto-aes.js'
-import { classifyAtolError } from '../src/lib/fiscal/atol.js'
+import { classifyAtolError } from '../src/services/fiscal/atol.js'
 import { authHeaders, baseHandler, COMPANY_ID, makeFakePool, testConfig } from './helpers.js'
 
 const FISCAL_KEY = 'test-fiscal-key-that-is-long-enough-1234567890'

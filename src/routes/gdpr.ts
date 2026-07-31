@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { withTransaction, type DbPool } from '../db.js'
 import { Errors } from '../lib/errors.js'
 import { verifyPassword } from '../lib/passwords.js'
-import { fromRequest, logSecurityEvent } from '../lib/security-log.js'
+import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 
 /**
  * GDPR / 152-ФЗ (B5).
