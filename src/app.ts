@@ -17,7 +17,7 @@ import { startFiscalWorker } from './workers/fiscal-worker.js'
 import { startPushWorker } from './workers/push-worker.js'
 import { bindWebhookMetrics, startWebhookDispatcher } from './workers/webhook-dispatcher.js'
 import { registerAuth } from './plugins/auth.js'
-import { registerAdminRoutes } from './routes/admin.js'
+import { registerAdminRoutes, registerPublicConfigRoutes } from './routes/admin.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { registerCompanyRoutes } from './routes/companies.js'
 import { registerCustomerRoutes } from './routes/customers.js'
@@ -38,6 +38,7 @@ import { registerSubscriptionRoutes } from './routes/subscription.js'
 import { registerSupportRoutes } from './routes/support.js'
 import { registerSyncRoutes } from './routes/sync.js'
 import { registerWebhookRoutes } from './routes/webhooks.js'
+import { registerTrackRoutes, registerFeatureUsageAdminRoutes } from './routes/track.js'
 
 export type BuildAppOptions = {
 	config: Config
@@ -165,7 +166,10 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 	registerApiKeyRoutes(app, pool)
 	registerWebhookRoutes(app, pool)
 	registerPublicRoutes(app, pool)
+	registerPublicConfigRoutes(app, pool)
 	registerGdprRoutes(app, pool)
+	registerTrackRoutes(app, pool)
+	registerFeatureUsageAdminRoutes(app, pool)
 
 	const eventBus = opts.eventBus === null ? null : opts.eventBus ?? createEventBus(pool)
 	if (eventBus) {
