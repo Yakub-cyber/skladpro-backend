@@ -8,9 +8,14 @@
 -- ║                                                                          ║
 -- ║ Разрешено:  sales_shipment, retail_receipt (товар физически ушёл).       ║
 -- ║ Запрещено:  transfer, writeoff, purchase_return, sales_return в расходе, ║
--- ║             inventory, opening_stock, unpost_doc (нельзя увезти/списать  ║
--- ║             то, чего нет; распроведение прихода после расхода — ошибка). ║
+-- ║             inventory, opening_stock (нельзя увезти/списать то, чего    ║
+-- ║             нет). unpost_doc разрешает минус — это исправление ошибки.  ║
 -- ╚══════════════════════════════════════════════════════════════════════════╝
+
+-- Снимаем CHECK-ограничения, запрещавшие отрицательный остаток.
+-- stock_balances.qty — реестр; products.stock — зеркало (sync_product_mirror).
+alter table stock_balances drop constraint if exists stock_balances_non_negative;
+alter table products drop constraint if exists products_stock_check;
 
 -- Сносим старую 5-аргументную версию — сигнатура меняется, replace недостаточно.
 drop function if exists apply_stock(uuid, text, text, numeric, numeric);
@@ -222,4 +227,49 @@ begin
    where company_id = p_company and id = p_doc;
 
   return total;
+end $$;
+
+-- unpost_doc: распроведение разрешает минус всегда. Оператор ошибся в
+-- количестве, товар уже продан — распровести и исправить документ должно быть
+-- возможно. Минус при распроведении — тот же «непроведённый приход», только
+-- наоборот (непроведённое исправление). Блокировка здесь не защищает данные,
+-- а делает ошибку неисправимой.
+create or replace function unpost_doc(p_company uuid, p_doc text)
+returns void language plpgsql as $$
+declare
+  d docs%rowtype;
+  m record;
+begin
+  perform set_config('app.ledger', '1', true);
+
+  select * into d from docs
+   where company_id = p_company and id = p_doc for update;
+  if not found then
+    raise exception 'Документ % не найден', p_doc using errcode = 'P0002';
+  end if;
+  if d.status <> 'posted' then
+    raise exception 'Документ % не проведён', p_doc using errcode = 'P0008';
+  end if;
+
+  for m in
+    select * from stock_movements
+     where company_id = p_company and doc_id = p_doc
+     order by qty asc
+  loop
+    perform apply_stock(p_company, m.warehouse_id, m.product_id, -m.qty,
+                        case when m.qty < 0 then -m.cost_amount else null end,
+                        true);
+    perform sync_product_mirror(p_company, m.product_id);
+  end loop;
+
+  delete from stock_movements where company_id = p_company and doc_id = p_doc;
+  delete from money_movements where company_id = p_company and doc_id = p_doc;
+  delete from settlement_movements where company_id = p_company and doc_id = p_doc;
+
+  if d.party_id is not null then
+    perform sync_party_mirror(p_company, d.party_kind, d.party_id);
+  end if;
+
+  update docs set status = 'draft', posted_at = null
+   where company_id = p_company and id = p_doc;
 end $$;

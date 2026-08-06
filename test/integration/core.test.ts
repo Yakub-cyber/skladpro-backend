@@ -149,19 +149,29 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(await drift(ctx)).toEqual([])
 	})
 
-	it('перемещение сверх остатка отклоняется — товар физически на «Основном» отсутствует', async () => {
+	it('перемещение сверх остатка отклоняется — товар физически на складе отсутствует', async () => {
+		// Transfer ещё не реализован в REST API (нет в DocumentBody enum),
+		// поэтому тестируем через прямой SQL — post_doc с doc_type='transfer'.
 		const have = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
-		const res = await call(ctx, 'POST', '/v1/documents/post', {
-			document: {
-				id: 'doc-transfer-too-big',
-				type: 'transfer',
-				warehouseId: ctx.ids.warehouse,
-				warehouseToId: ctx.ids.warehouse2,
-				items: [{ productId: ctx.ids.product, qty: have + 5000 }],
-			},
-		})
-		expect(res.statusCode).toBeGreaterThanOrEqual(400)
-		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+		const docId = 'doc-transfer-too-big'
+		await ctx.pool.query(
+			`insert into docs (company_id, id, doc_type, warehouse_id, warehouse_to_id)
+			 values ($1,$2,'transfer',$3,$4)`,
+			[ctx.companyId, docId, ctx.ids.warehouse, ctx.ids.warehouse2])
+		await ctx.pool.query(
+			`insert into doc_lines (company_id, id, doc_id, line_no, product_id, qty, price)
+			 values ($1,$2,$3,1,$4,$5,0)`,
+			[ctx.companyId, `${docId}-0`, docId, ctx.ids.product, have + 5000])
+
+		try {
+			await ctx.pool.query('select post_doc($1,$2)', [ctx.companyId, docId])
+			expect.unreachable('should have thrown P0001')
+		} catch (err: any) {
+			expect(err.code).toBe('P0001')
+		}
+		// Cleanup: doc stays as draft, no movements created
+		await ctx.pool.query('delete from doc_lines where company_id=$1 and doc_id=$2', [ctx.companyId, docId])
+		await ctx.pool.query('delete from docs where company_id=$1 and id=$2', [ctx.companyId, docId])
 	})
 
 	it('списание сверх остатка отклоняется — списывать нечего', async () => {
@@ -177,6 +187,45 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		})
 		expect(res.statusCode).toBeGreaterThanOrEqual(400)
 		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+	})
+
+	it('распроведение прихода после продажи уводит в минус (исправление ошибки оператора)', async () => {
+		// Оператор ошибся в количестве прихода, товар уже продан.
+		// Распроведение и перепроведение с правильным количеством должно работать.
+		const docId = 'doc-in-fixable'
+		await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: docId,
+				type: 'receive',
+				warehouseId: ctx.ids.warehouse,
+				supplierId: ctx.ids.supplier,
+				items: [{ productId: ctx.ids.product, qty: 100, cost: 30 }],
+			},
+		})
+		const afterIncome = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+
+		// Продаём часть
+		await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-before-unpost',
+				customerId: ctx.ids.customer,
+				onCredit: true,
+				discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 80, price: 50 }],
+			},
+		})
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(afterIncome - 80)
+
+		// Распроводим ошибочный приход — уводит в минус, но должно пройти
+		const dbDocId = (await ctx.pool.query(
+			`select id from docs where company_id=$1 and order_id is null and doc_type='purchase_receipt'
+			 and status='posted' order by posted_at desc limit 1`, [ctx.companyId])).rows[0]?.id
+			?? `receive-${docId}`
+
+		await ctx.pool.query('select unpost_doc($1,$2)', [ctx.companyId, dbDocId])
+		const afterUnpost = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		expect(afterUnpost).toBeLessThan(0)
+		expect(await drift(ctx)).toEqual([])
 	})
 
 	it('повтор запроса с тем же Idempotency-Key не задваивает проводку', async () => {
