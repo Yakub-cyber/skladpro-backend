@@ -188,15 +188,38 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				}
 			}
 
-			// Сохраняем в orders для совместимости с текущим фронтом
+			// Сохраняем в orders для совместимости с текущим фронтом.
+			// on conflict do update: если sync/push успел раньше и оставил
+			// заглушку со status='new', перезаписываем на 'delivered' —
+			// это единственный источник истины для розничного чека.
+			// docs/doc_lines уже вставлены выше и post_doc() успешно списал
+			// остатки; отсутствие идемпотентности через сам INSERT в orders
+			// закрыто через claimIdempotencyKey — второй /v1/sales с тем же
+			// idem-ключом сюда не доходит.
 			const enrichedItems = items.map(it => ({ ...it }))
-			const insertedOrder = await client.query(
+			// shipment_doc_id — серверный маркер «заказ ушёл документным путём».
+			// Клиент получает его через pull: без него свежая вкладка не знала бы,
+			// что отмена этого заказа должна идти через /v1/orders/:id/status.
+			await client.query(
 				`insert into orders
 				   (company_id, id, no, customer_id, customer_name, items, subtotal, discount, total,
-				    price_type_id, on_credit, status, stock_consumed, shift_id, track)
-				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'delivered',true,$12,$13)
-				 on conflict (company_id, id) do nothing
-				 returning id`,
+				    price_type_id, on_credit, status, stock_consumed, shift_id, track, shipment_doc_id)
+				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'delivered',true,$12,$13,$14)
+				 on conflict (company_id, id) do update set
+				   no = coalesce(orders.no, excluded.no),
+				   customer_id = coalesce(orders.customer_id, excluded.customer_id),
+				   customer_name = coalesce(orders.customer_name, excluded.customer_name),
+				   items = excluded.items,
+				   subtotal = excluded.subtotal,
+				   discount = excluded.discount,
+				   total = excluded.total,
+				   price_type_id = coalesce(orders.price_type_id, excluded.price_type_id),
+				   on_credit = excluded.on_credit,
+				   status = 'delivered',
+				   stock_consumed = true,
+				   shift_id = coalesce(orders.shift_id, excluded.shift_id),
+				   track = excluded.track,
+				   shipment_doc_id = excluded.shipment_doc_id`,
 				[
 					auth.companyId,
 					order.id,
@@ -211,9 +234,9 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 					order.onCredit,
 					order.shiftId ?? null,
 					JSON.stringify(order.track ?? [{ type: 'paid', at: new Date().toISOString(), by: actor }]),
+					docId,
 				],
 			)
-			if (insertedOrder.rows.length === 0) throw Errors.duplicate(`Заказ ${order.id}`)
 
 			await client.query(
 				`insert into audit (company_id, id, "by", title, section, type)

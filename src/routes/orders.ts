@@ -155,10 +155,14 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					}
 				}
 
-				await client.query(`update orders set stock_consumed = true where company_id = $1 and id = $2`, [
-					auth.companyId,
-					orderId,
-				])
+				// stock_consumed + маркер серверного пути: клиент по shipment_doc_id
+				// понимает, что дальнейшие переходы (в т.ч. отмена) идут через
+				// этот эндпоинт, а не через sync/push.
+				await client.query(
+					`update orders set stock_consumed = true, shipment_doc_id = $3
+					 where company_id = $1 and id = $2`,
+					[auth.companyId, orderId, docId],
+				)
 			}
 
 			// cancelled после отгрузки: распроводим все документы по этому заказу
