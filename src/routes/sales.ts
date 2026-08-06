@@ -2,22 +2,16 @@ import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
-import { ApiError, Errors } from '../lib/errors.js'
+import { ApiError, Errors, mapPgError } from '../lib/errors.js'
 import { publishEvent } from '../services/events.js'
-import { consumeFifo, round4, type Batch } from '../lib/fifo.js'
+import { round4 } from '../lib/utils.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
 import { IdempotencyKey, SaleBody } from '../schemas/sale.js'
 
-const EPS = 0.000001
-
 /**
  * POST /v1/sales — продажа (POS или веб).
- *
- *  - остаток проверяется и списывается под SELECT … FOR UPDATE
- *    (две кассы не продадут последнюю штуку одновременно);
- *  - суммы пересчитываются на сервере, клиентскому total не верим;
- *  - движения (movements) и аудит пишет сервер от имени проверенного пользователя;
- *  - Idempotency-Key обязателен: ретрай из offline-очереди не спишет остаток дважды.
+ * Создаёт документ sales_shipment (опт, в долг) или retail_receipt (розница).
+ * Вся арифметика остатков/себестоимости/взаиморасчётов — в post_doc().
  */
 export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 	app.post('/v1/sales', { preHandler: app.authenticate }, async (request, reply) => {
@@ -40,40 +34,32 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 			})
 			if (claim.replay) return { status: claim.status, body: claim.response, replayed: true }
 
-			// qty округляем до 4 знаков — иначе весовой товар с копеечным «хвостом»
-			// (0.3 vs 0.3000000000000004 из-за float-суммирования) проходит app-check и
-			// падает на DB check(stock>=0) c 500 INTERNAL, зависая в offline-outbox.
-			// Детерминированный порядок блокировок — защита от deadlock между кассами.
 			const items = order.items
 				.map(it => ({ ...it, qty: round4(it.qty) }))
 				.sort((a, b) => a.productId.localeCompare(b.productId))
 
-			const products = new Map<
-				string,
-				{ name: string; stock: number; cost: number; batches: Batch[]; marked: boolean; codes: string[] }
-			>()
+			const actor = auth.memberName ?? auth.email ?? auth.userId
+			const isRetail = !order.customerId || order.customerId === 'retail'
+			const isCredit = order.onCredit && !isRetail
+
+			// Коды маркировки: проверяем до создания документа
+			const products = new Map<string, { name: string; marked: boolean; codes: string[] }>()
 			for (const item of items) {
 				if (products.has(item.productId)) continue
 				const { rows } = await client.query(
-					`select id, name, stock, cost, batches, marked, codes from products
-					 where company_id = $1 and id = $2 and deleted_at is null
-					 for update`,
+					`select name, marked, codes from products
+					 where company_id = $1 and id = $2 and deleted_at is null`,
 					[auth.companyId, item.productId],
 				)
 				const row = rows[0]
 				if (!row) throw Errors.notFound(`Товар ${item.productId}`)
 				products.set(item.productId, {
 					name: row.name,
-					stock: Number(row.stock ?? 0),
-					cost: Number(row.cost ?? 0),
-					batches: Array.isArray(row.batches) ? row.batches : [],
 					marked: !!row.marked,
 					codes: Array.isArray(row.codes) ? row.codes.map((c: unknown) => String(c)) : [],
 				})
 			}
 
-			// Коды маркировки: собираем по товару, проверяем что все они есть в
-			// пуле, дубликаты запрещены. Отсекаем ДО списания остатка.
 			const consumedCodes = new Map<string, string[]>()
 			for (const item of items) {
 				if (!item.markCodes?.length) continue
@@ -85,8 +71,8 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				if (uniq.length !== item.markCodes.length) {
 					throw Errors.validation([{ message: `Товар ${item.productId}: дубликаты в markCodes` }])
 				}
-				const pool = new Set(p.codes)
-				const missing = uniq.filter(c => !pool.has(c))
+				const codePool = new Set(p.codes)
+				const missing = uniq.filter(c => !codePool.has(c))
 				if (missing.length) {
 					throw new ApiError(
 						409,
@@ -99,65 +85,94 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				consumedCodes.set(item.productId, [...prev, ...uniq])
 			}
 
-			// Суммарное количество по товару (один товар мог прийти двумя строками).
+			// Суммы пересчитываем на сервере
+			const subtotal = round2(items.reduce((sum, it) => sum + it.qty * it.price, 0))
+			const discount = round2(order.discount)
+			const total = round2(subtotal - discount)
+			if (total < -0.000001) throw Errors.validation([{ message: 'Скидка больше суммы чека' }])
+
+			// Склад по умолчанию
+			const { rows: whs } = await client.query(
+				`select id from warehouses where company_id = $1 and deleted_at is null order by id limit 1`,
+				[auth.companyId],
+			)
+			const warehouseId = whs[0]?.id ?? null
+
+			// Счёт денег по умолчанию (для retail_receipt)
+			let accountId: string | null = null
+			if (!isCredit) {
+				const { rows: accs } = await client.query(
+					`select id from money_accounts where company_id = $1 and deleted_at is null order by is_default desc, id limit 1`,
+					[auth.companyId],
+				)
+				accountId = accs[0]?.id ?? null
+			}
+
+			const docId = `sale-${order.id}`
+			const docType = isCredit ? 'sales_shipment' : 'retail_receipt'
+
+			await client.query(
+				`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id,
+				                   account_id, price_type_id, order_id, discount, "by")
+				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+				[
+					auth.companyId, docId, docType, warehouseId,
+					isCredit ? 'customer' : null,
+					isCredit ? order.customerId : null,
+					accountId,
+					order.priceTypeId ?? null,
+					order.id,
+					discount,
+					actor,
+				],
+			)
+
+			for (const [i, item] of items.entries()) {
+				await client.query(
+					`insert into doc_lines (company_id, id, doc_id, line_no, product_id, unit_id, unit_factor,
+					                        qty_input, qty, price)
+					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+					[
+						auth.companyId, `${docId}-${i}`, docId, i, item.productId,
+						null, 1, item.qty, item.qty, item.price,
+					],
+				)
+			}
+
+			try {
+				await client.query('select post_doc($1,$2)', [auth.companyId, docId])
+			} catch (err) {
+				throw mapPgError(err)
+			}
+
+			// Коды маркировки: списываем из products.codes
+			for (const [productId, codes] of consumedCodes) {
+				const p = products.get(productId)!
+				const consumedSet = new Set(codes)
+				const nextCodes = p.codes.filter(c => !consumedSet.has(c))
+				await client.query(
+					`update products set codes = $3 where company_id = $1 and id = $2`,
+					[auth.companyId, productId, JSON.stringify(nextCodes)],
+				)
+			}
+			// Для маркированных без явных кодов — снимаем первые N
 			const totalsByProduct = new Map<string, number>()
 			for (const item of items) {
 				totalsByProduct.set(item.productId, round4((totalsByProduct.get(item.productId) ?? 0) + item.qty))
 			}
 			for (const [productId, qty] of totalsByProduct) {
 				const p = products.get(productId)!
-				// Строгая проверка на уже округлённом qty. EPS убран сознательно.
-				if (p.stock < qty) throw Errors.insufficientStock(productId, p.stock, qty)
-			}
-
-			const subtotal = round2(items.reduce((sum, it) => sum + it.qty * it.price, 0))
-			const discount = round2(order.discount)
-			const total = round2(subtotal - discount)
-			if (total < -EPS) throw Errors.validation([{ message: 'Скидка больше суммы чека' }])
-
-			const actor = auth.memberName ?? auth.email ?? auth.userId
-			const now = new Date().toISOString()
-
-			// Себестоимость по FIFO: партии съедаются по каждой строке чека.
-			const itemCogs = new Map<(typeof items)[number], number>()
-			for (const item of items) {
-				const p = products.get(item.productId)!
-				const consumed = consumeFifo(p.batches, item.qty, p.cost)
-				p.batches = consumed.batches
-				itemCogs.set(item, consumed.cogs)
-			}
-
-			for (const [productId, qty] of totalsByProduct) {
-				const p = products.get(productId)!
-				// Если сканировали конкретные КМ — снимаем именно их. Иначе, для
-				// маркированного товара без явного скана, снимаем «первые N» из
-				// пула (совместимость с текущим поведением POS-кассы).
-				const consumed = consumedCodes.get(productId)
-				let nextCodes = p.codes
-				if (p.marked) {
-					if (consumed?.length) {
-						const consumedSet = new Set(consumed)
-						nextCodes = p.codes.filter(c => !consumedSet.has(c))
-					} else if (p.codes.length > 0) {
-						nextCodes = p.codes.slice(Math.min(p.codes.length, Math.ceil(qty)))
-					}
+				if (p.marked && !consumedCodes.has(productId) && p.codes.length > 0) {
+					const nextCodes = p.codes.slice(Math.min(p.codes.length, Math.ceil(qty)))
+					await client.query(
+						`update products set codes = $3 where company_id = $1 and id = $2`,
+						[auth.companyId, productId, JSON.stringify(nextCodes)],
+					)
 				}
-				await client.query(
-					`update products set stock = stock - $3, batches = $4, codes = $5
-					 where company_id = $1 and id = $2`,
-					[auth.companyId, productId, qty, JSON.stringify(p.batches), JSON.stringify(nextCodes)],
-				)
 			}
 
-			// Сохраняем в order.items ВЗВЕШЕННУЮ себестоимость каждой строки —
-			// чтобы возврат восстановил FIFO-партию по цене продажи (иначе stock
-			// расходится с sum(batches) навсегда).
-			const enrichedItems = items.map(it => {
-				const cogs = itemCogs.get(it) ?? 0
-				const cost = it.qty > 0 ? round4(cogs / it.qty) : 0
-				return { ...it, cost }
-			})
-
+			// Сохраняем в orders для совместимости с текущим фронтом
+			const enrichedItems = items.map(it => ({ ...it }))
 			const insertedOrder = await client.query(
 				`insert into orders
 				   (company_id, id, no, customer_id, customer_name, items, subtotal, discount, total,
@@ -178,50 +193,10 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 					order.priceTypeId ?? null,
 					order.onCredit,
 					order.shiftId ?? null,
-					JSON.stringify(order.track ?? [{ type: 'paid', at: now, by: actor }]),
+					JSON.stringify(order.track ?? [{ type: 'paid', at: new Date().toISOString(), by: actor }]),
 				],
 			)
 			if (insertedOrder.rows.length === 0) throw Errors.duplicate(`Заказ ${order.id}`)
-
-			// Продажа «в долг» реального клиента (не «розница/retail») увеличивает
-			// его баланс на сумму чека. Атомарно с продажей — иначе между
-			// устройствами долг разъезжается. Баланс сервер держит как источник
-			// истины (клиенты через sync-push его не пишут: `balance` в SERVER_MANAGED).
-			if (order.onCredit && order.customerId && order.customerId !== 'retail' && total > 0) {
-				const upd = await client.query(
-					`update customers set balance = coalesce(balance, 0) + $3
-					 where company_id = $1 and id = $2 and deleted_at is null
-					 returning id`,
-					[auth.companyId, order.customerId, total],
-				)
-				// Клиент удалён/не в этой компании — тихо игнорируем (не блокируем
-				// продажу; долг остаётся некому — в отчётах это заметно).
-				if (upd.rows.length > 0) {
-					await client.query(
-						`insert into audit (company_id, id, "by", title, section, type)
-						 values ($1, $2, $3, $4, 'finance', 'credit')`,
-						[auth.companyId, randomUUID(), actor, `Долг +${total} по продаже №${order.no ?? order.id}`],
-					)
-				}
-			}
-
-			for (const item of items) {
-				await client.query(
-					`insert into movements (company_id, id, type, product_id, name, qty, delta, cost, reason, "by")
-					 values ($1,$2,'sale',$3,$4,$5,$6,$7,$8,$9)`,
-					[
-						auth.companyId,
-						randomUUID(),
-						item.productId,
-						item.name ?? products.get(item.productId)!.name,
-						item.qty,
-						-item.qty,
-						itemCogs.get(item) ?? null,
-						`Продажа №${order.no ?? order.id}`,
-						actor,
-					],
-				)
-			}
 
 			await client.query(
 				`insert into audit (company_id, id, "by", title, section, type)
@@ -236,8 +211,6 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 
 		if (result.replayed) reply.header('idempotency-replayed', 'true')
 		reply.code(result.status)
-		// Публикуем событие ПОСЛЕ COMMIT — иначе realtime не увидел бы данных.
-		// Первичный ретрай (replay) не публикуем — событие уже было при первой попытке.
 		if (!result.replayed) {
 			publishEvent(pool, { companyId: auth.companyId, type: 'sale', id: bodyParsed.data.order.id, senderUserId: auth.userId })
 		}

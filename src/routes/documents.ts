@@ -5,9 +5,10 @@ import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
 import { Errors } from '../lib/errors.js'
 import { publishEvent } from '../services/events.js'
-import { consumeFifo, round4 } from '../lib/fifo.js'
+import { round4 } from '../lib/utils.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
 import { IdempotencyKey } from '../schemas/sale.js'
+import { mapPgError } from '../lib/errors.js'
 
 const id = z.string().min(1).max(64)
 
@@ -16,32 +17,26 @@ const DocItem = z.object({
 	name: z.string().max(300).optional(),
 	qty: z.number().finite().min(0).max(1_000_000),
 	cost: z.number().finite().min(0).optional(),
+	unitId: id.optional(),
+	unitFactor: z.number().finite().positive().optional(),
 })
 
 const DocumentBody = z.object({
 	document: z.object({
 		id: id,
 		no: z.string().max(64).optional(),
-		// receive — приход (+stock, пересчёт себестоимости, новая FIFO-партия)
-		// writeoff — списание (−stock c проверкой остатка)
-		// adjust — инвентаризация (stock := qty)
 		type: z.enum(['receive', 'writeoff', 'adjust']),
 		items: z.array(DocItem).min(1).max(500),
 		reason: z.string().max(500).optional(),
 		note: z.string().max(2000).optional(),
+		warehouseId: id.optional(),
+		supplierId: id.optional(),
 	}),
 })
 
-const MOVEMENT_TYPE: Record<string, string> = {
-	receive: 'receive',
-	writeoff: 'writeoff',
-	adjust: 'inventory',
-}
-
 /**
  * POST /v1/documents/post — проводка складского документа.
- * Атомарно: блокировка товаров, изменение остатков, партии FIFO (для прихода),
- * запись документа + движений + аудита. Idempotency-Key обязателен.
+ * Вставляет docs + doc_lines, вызывает post_doc(). Вся арифметика — в БД.
  */
 export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 	app.post('/v1/documents/post', { preHandler: app.authenticate }, async (request, reply) => {
@@ -64,72 +59,80 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 			})
 			if (claim.replay) return { status: claim.status, body: claim.response, replayed: true }
 
-			const items = [...doc.items].sort((a, b) => a.productId.localeCompare(b.productId))
 			const actor = auth.memberName ?? auth.email ?? auth.userId
-			const movements: Array<{ productId: string; name: string; qty: number; delta: number; cost: number | null }> = []
-			let totalQty = 0
 
-			for (const item of items) {
-				const { rows } = await client.query(
-					`select id, name, stock, cost, batches from products
-					 where company_id = $1 and id = $2 and deleted_at is null
-					 for update`,
-					[auth.companyId, item.productId],
-				)
-				const p = rows[0]
-				if (!p) throw Errors.notFound(`Товар ${item.productId}`)
-				const stock = Number(p.stock ?? 0)
-				const cost = Number(p.cost ?? 0)
-				const batches: Array<{ id: string; qty: number; cost: number; at: string }> = Array.isArray(p.batches)
-					? p.batches
-					: []
+			// Маппинг старых типов на новые doc_type
+			let docType: string
+			let partyKind: string | null = null
+			let partyId: string | null = null
 
-				if (doc.type === 'receive') {
-					if (item.qty <= 0) throw Errors.validation([{ message: `Приход ${item.productId}: qty должен быть > 0` }])
-					const newCost = item.cost ?? cost
-					// Средневзвешенная себестоимость + новая FIFO-партия.
-					const nextCost = stock + item.qty > 0 ? round4((stock * cost + item.qty * newCost) / (stock + item.qty)) : newCost
-					batches.push({ id: randomUUID(), qty: item.qty, cost: newCost, at: new Date().toISOString() })
-					await client.query(
-						`update products set stock = stock + $3, cost = $4, batches = $5
-						 where company_id = $1 and id = $2`,
-						[auth.companyId, item.productId, item.qty, nextCost, JSON.stringify(batches)],
-					)
-					movements.push({ productId: item.productId, name: item.name ?? p.name, qty: item.qty, delta: item.qty, cost: newCost })
-					totalQty += item.qty
-				} else if (doc.type === 'writeoff') {
-					if (item.qty <= 0) throw Errors.validation([{ message: `Списание ${item.productId}: qty должен быть > 0` }])
-					if (stock + 1e-6 < item.qty) throw Errors.insufficientStock(item.productId, stock, item.qty)
-					const consumed = consumeFifo(batches, item.qty, cost)
-					await client.query(
-						`update products set stock = stock - $3, batches = $4
-						 where company_id = $1 and id = $2`,
-						[auth.companyId, item.productId, item.qty, JSON.stringify(consumed.batches)],
-					)
-					movements.push({ productId: item.productId, name: item.name ?? p.name, qty: item.qty, delta: -item.qty, cost: consumed.cogs })
-					totalQty += item.qty
+			if (doc.type === 'receive') {
+				if (doc.supplierId) {
+					docType = 'purchase_receipt'
+					partyKind = 'supplier'
+					partyId = doc.supplierId
 				} else {
-					// adjust: item.qty — НОВЫЙ фактический остаток.
-					const delta = round4(item.qty - stock)
-					if (Math.abs(delta) < 1e-9) continue
-					const nextBatches =
-						delta > 0
-							? [...batches, { id: randomUUID(), qty: delta, cost, at: new Date().toISOString() }]
-							: consumeFifo(batches, -delta, cost).batches
-					await client.query(
-						`update products set stock = $3, batches = $4 where company_id = $1 and id = $2`,
-						[auth.companyId, item.productId, item.qty, JSON.stringify(nextBatches)],
-					)
-					movements.push({ productId: item.productId, name: item.name ?? p.name, qty: Math.abs(delta), delta, cost: null })
-					totalQty += Math.abs(delta)
+					docType = 'stock_income'
 				}
+			} else if (doc.type === 'writeoff') {
+				docType = 'writeoff'
+			} else {
+				docType = 'inventory'
 			}
 
-			const insertedDoc = await client.query(
+			// Склад: из документа или первый активный
+			let warehouseId = doc.warehouseId ?? null
+			if (!warehouseId) {
+				const { rows: whs } = await client.query(
+					`select id from warehouses where company_id = $1 and deleted_at is null order by id limit 1`,
+					[auth.companyId],
+				)
+				warehouseId = whs[0]?.id ?? null
+			}
+
+			await client.query(
+				`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id, note, reason, "by")
+				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+				[auth.companyId, doc.id, docType, warehouseId, partyKind, partyId, doc.note ?? null, doc.reason ?? null, actor],
+			)
+
+			const items = [...doc.items].sort((a, b) => a.productId.localeCompare(b.productId))
+
+			for (const [i, item] of items.entries()) {
+				const factor = item.unitFactor ?? 1
+				const qtyBase = round4(item.qty * factor)
+				await client.query(
+					`insert into doc_lines (company_id, id, doc_id, line_no, product_id, unit_id, unit_factor,
+					                        qty_input, qty, price)
+					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+					[
+						auth.companyId,
+						`${doc.id}-${i}`,
+						doc.id,
+						i,
+						item.productId,
+						item.unitId ?? null,
+						factor,
+						item.qty,
+						qtyBase,
+						item.cost ?? 0,
+					],
+				)
+			}
+
+			let total: number
+			try {
+				const { rows } = await client.query('select post_doc($1,$2) as total', [auth.companyId, doc.id])
+				total = Number(rows[0].total)
+			} catch (err) {
+				throw mapPgError(err)
+			}
+
+			// Совместимость: пишем в старую таблицу documents тоже
+			await client.query(
 				`insert into documents (company_id, id, no, type, status, items, reason, note, total_qty, "by", posted_at)
 				 values ($1,$2,$3,$4,'posted',$5,$6,$7,$8,$9, now())
-				 on conflict (company_id, id) do nothing
-				 returning id`,
+				 on conflict (company_id, id) do nothing`,
 				[
 					auth.companyId,
 					doc.id,
@@ -138,30 +141,10 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 					JSON.stringify(doc.items),
 					doc.reason ?? null,
 					doc.note ?? null,
-					totalQty,
+					items.reduce((s, it) => s + it.qty, 0),
 					actor,
 				],
 			)
-			if (insertedDoc.rows.length === 0) throw Errors.duplicate(`Документ ${doc.id}`)
-
-			for (const m of movements) {
-				await client.query(
-					`insert into movements (company_id, id, type, product_id, name, qty, delta, cost, reason, "by")
-					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-					[
-						auth.companyId,
-						randomUUID(),
-						MOVEMENT_TYPE[doc.type],
-						m.productId,
-						m.name,
-						m.qty,
-						m.delta,
-						m.cost,
-						doc.reason ?? `Документ №${doc.no ?? doc.id}`,
-						actor,
-					],
-				)
-			}
 
 			await client.query(
 				`insert into audit (company_id, id, "by", title, section, type)
@@ -169,7 +152,7 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 				[auth.companyId, randomUUID(), actor, `Документ ${doc.type} №${doc.no ?? doc.id}`, doc.type],
 			)
 
-			const body = { ok: true, document: { id: doc.id, type: doc.type, totalQty, movements: movements.length } }
+			const body = { ok: true, document: { id: doc.id, type: doc.type, total } }
 			await storeIdempotentResponse(client, auth.companyId, idemKey, 201, body)
 			return { status: 201, body, replayed: false }
 		})
@@ -182,4 +165,3 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 		return result.body
 	})
 }
-

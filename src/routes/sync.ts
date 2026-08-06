@@ -61,16 +61,19 @@ const PULL_EXCLUDE_BASE: Record<string, string[]> = {
 // коммерческой тайны и PII.
 const COURIER_TABLES = new Set(['orders', 'customers', 'warehouses', 'cells', 'employees'])
 const COURIER_EXTRA_EXCLUDE: Record<string, string[]> = {
-	// себестоимости и партий курьер не видит
 	products: ['cost', 'batches', 'min_stock', 'prices'],
 	movements: ['cost'],
 	customers: ['balance', 'bonus', 'total_spent'],
 	orders: ['discount', 'subtotal'],
+	stock_balances: ['cost_amount'],
+	doc_lines: ['price', 'cost_amount'],
 }
 
 const PULL_TABLES = Object.freeze([
 	'price_types', 'warehouses', 'cells', 'products', 'customers', 'suppliers',
 	'employees', 'orders', 'invoices', 'documents', 'movements', 'shifts', 'audit',
+	'docs', 'doc_lines', 'product_units', 'money_accounts', 'stock_balances',
+	'product_aliases', 'doc_counters',
 ] as const)
 const PULL_TABLES_SET = new Set(PULL_TABLES)
 
