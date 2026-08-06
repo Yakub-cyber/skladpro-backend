@@ -145,6 +145,16 @@ export async function stockAt(ctx: Ctx, warehouseId: string, productId: string):
 	return Number(rows[0].qty)
 }
 
+/** Себестоимость на складе из реестра stock_balances. */
+export async function costAt(ctx: Ctx, warehouseId: string, productId: string): Promise<{ qty: number; costAmount: number }> {
+	const { rows } = await ctx.pool.query(
+		`select coalesce(qty,0) as qty, coalesce(cost_amount,0) as cost_amount
+		   from stock_balances
+		  where company_id=$1 and warehouse_id=$2 and product_id=$3`,
+		[ctx.companyId, warehouseId, productId])
+	return { qty: Number(rows[0]?.qty ?? 0), costAmount: Number(rows[0]?.cost_amount ?? 0) }
+}
+
 /** Долг контрагента из реестра взаиморасчётов: + должен нам, − должны мы. */
 export async function debt(ctx: Ctx, kind: 'customer' | 'supplier', partyId: string): Promise<number> {
 	const { rows } = await ctx.pool.query(

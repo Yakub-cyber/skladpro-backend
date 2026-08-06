@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { call, cash, debt, drift, hasDb, setupIntegration, stockAt, type Ctx } from './helpers.js'
+import { call, cash, costAt, debt, drift, hasDb, setupIntegration, stockAt, type Ctx } from './helpers.js'
 
 /**
  * Сквозной тест учётного ядра на живой базе.
@@ -149,9 +149,11 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(await drift(ctx)).toEqual([])
 	})
 
-	it('перемещение через API: товар уходит с одного склада и приходит на другой', async () => {
-		const before1 = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
-		const before2 = await stockAt(ctx, ctx.ids.warehouse2, ctx.ids.product)
+	it('перемещение через API: количество и себестоимость сходятся', async () => {
+		const before1 = await costAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const before2 = await costAt(ctx, ctx.ids.warehouse2, ctx.ids.product)
+		const totalCostBefore = before1.costAmount + before2.costAmount
+		const avgBefore = before1.qty > 0 ? before1.costAmount / before1.qty : 0
 		const qty = 10
 
 		const res = await call(ctx, 'POST', '/v1/documents/post', {
@@ -165,9 +167,36 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		})
 		expect(res.statusCode).toBe(201)
 
-		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(before1 - qty)
-		expect(await stockAt(ctx, ctx.ids.warehouse2, ctx.ids.product)).toBe(before2 + qty)
+		const after1 = await costAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const after2 = await costAt(ctx, ctx.ids.warehouse2, ctx.ids.product)
+
+		// Количество переместилось
+		expect(after1.qty).toBe(before1.qty - qty)
+		expect(after2.qty).toBe(before2.qty + qty)
+
+		// Сумма cost_amount по компании не изменилась
+		const totalCostAfter = after1.costAmount + after2.costAmount
+		expect(totalCostAfter).toBeCloseTo(totalCostBefore, 2)
+
+		// Средняя на приёмном складе = средней источника (товар пришёл по той же цене)
+		const avgAfter2 = after2.qty > 0 ? after2.costAmount / after2.qty : 0
+		expect(avgAfter2).toBeCloseTo(avgBefore, 2)
+
 		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('перемещение на тот же склад отклоняется валидацией', async () => {
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-transfer-same-wh',
+				type: 'transfer',
+				warehouseId: ctx.ids.warehouse,
+				warehouseToId: ctx.ids.warehouse,
+				items: [{ productId: ctx.ids.product, qty: 1 }],
+			},
+		})
+		expect(res.statusCode).toBe(400)
+		expect(res.json().error.code).toBe('VALIDATION_ERROR')
 	})
 
 	it('перемещение сверх остатка отклоняется — товар физически на складе отсутствует', async () => {
