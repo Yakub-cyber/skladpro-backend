@@ -1,6 +1,7 @@
 import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
 import rateLimit from '@fastify/rate-limit'
+import { randomUUID } from 'node:crypto'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { corsOrigins, type Config } from './config.js'
 import type { DbPool } from './db.js'
@@ -67,8 +68,14 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 			level: config.NODE_ENV === 'test' ? 'silent' : 'info',
 			redact: ['req.headers.authorization', 'req.headers["idempotency-key"]'],
 		},
+		genReqId: (req) => (req.headers['x-trace-id'] as string) || randomUUID(),
 		trustProxy: config.TRUST_PROXY,
-		bodyLimit: 512 * 1024, // 512 КБ хватает на чек в 500 позиций; защита от гигантских тел
+		bodyLimit: 512 * 1024,
+	})
+
+	app.addHook('onSend', (_req, reply, _payload, done) => {
+		reply.header('x-trace-id', _req.id)
+		done()
 	})
 
 	await app.register(helmet, { contentSecurityPolicy: false })

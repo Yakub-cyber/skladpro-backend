@@ -142,7 +142,7 @@ export function registerSyncRoutes(app: FastifyInstance, pool: DbPool) {
 		return { serverTime: new Date().toISOString(), tables: out }
 	})
 
-	app.post('/v1/sync/push', { preHandler: app.authenticate }, async request => {
+	app.post('/v1/sync/push', { preHandler: app.authenticate }, async (request, reply) => {
 		const auth = request.auth
 		if (auth.role === 'courier') throw Errors.forbidden('Курьеру запись недоступна')
 
@@ -154,10 +154,19 @@ export function registerSyncRoutes(app: FastifyInstance, pool: DbPool) {
 			try {
 				results.push(await applyOp(pool, auth, op))
 			} catch (err) {
-				// Одна ядовитая запись не валит батч.
-				results.push({ ok: false, error: err instanceof Error ? err.message.slice(0, 300) : 'unknown' })
+				const pgCode = err && typeof err === 'object' && 'code' in err ? (err as any).code : undefined
+				if (pgCode && typeof pgCode === 'string') {
+					request.log.error({ sqlstate: pgCode, table: op.table, id: op.row?.id }, `sync/push PG error ${pgCode}`)
+				}
+				results.push({
+					ok: false,
+					error: err instanceof Error ? err.message.slice(0, 300) : 'unknown',
+					code: pgCode ?? 'INTERNAL',
+				})
 			}
 		}
+		const hasFailures = results.some(r => !r.ok)
+		reply.code(hasFailures ? 207 : 200)
 		return { results }
 	})
 

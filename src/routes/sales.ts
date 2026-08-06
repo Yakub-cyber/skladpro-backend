@@ -143,7 +143,7 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 			try {
 				await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 			} catch (err) {
-				throw mapPgError(err)
+				throw mapPgError(err, request.log)
 			}
 
 			// Наличная продажа реальному клиенту: sales_shipment создал долг,
@@ -158,7 +158,7 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				try {
 					await client.query('select post_doc($1,$2)', [auth.companyId, payDocId])
 				} catch (err) {
-					throw mapPgError(err)
+					throw mapPgError(err, request.log)
 				}
 			}
 

@@ -302,7 +302,7 @@ describe('sync/push enforcement лимитов', () => {
 				}],
 			},
 		})
-		expect(res.statusCode).toBe(200)
+		expect(res.statusCode).toBe(207)
 		const body = res.json() as { results: Array<{ ok: boolean; code?: string }> }
 		expect(body.results[0]?.ok).toBe(false)
 		expect(body.results[0]?.code).toBe('SUBSCRIPTION_LIMIT_EXCEEDED')

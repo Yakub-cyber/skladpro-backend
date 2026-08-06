@@ -48,11 +48,18 @@ const PG_ERROR_MAP: Record<string, (msg: string) => ApiError> = {
 	P0009: (msg) => new ApiError(500, 'LEDGER_GUARD', msg),
 }
 
-export function mapPgError(err: unknown): Error {
+export function mapPgError(err: unknown, log?: { error: (obj: object, msg: string) => void }): Error {
 	if (err && typeof err === 'object' && 'code' in err && typeof (err as any).code === 'string') {
 		const pgCode = (err as any).code as string
 		const factory = PG_ERROR_MAP[pgCode]
 		if (factory) return factory((err as any).message ?? pgCode)
+		if (log) {
+			log.error(
+				{ sqlstate: pgCode, pgMessage: (err as any).message, pgDetail: (err as any).detail },
+				`unmapped PG error ${pgCode}`,
+			)
+		}
+		return new ApiError(500, 'DB_ERROR', (err as any).message ?? `Ошибка базы данных (${pgCode})`)
 	}
 	if (err instanceof Error) return err
 	return new Error(String(err))

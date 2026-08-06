@@ -129,12 +129,14 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 			}
 
 			let total: number
+			request.log.info({ docId: doc.id, docType, lines: items.length }, 'post_doc start')
 			try {
 				const { rows } = await client.query('select post_doc($1,$2) as total', [auth.companyId, doc.id])
 				total = Number(rows[0].total)
 			} catch (err) {
-				throw mapPgError(err)
+				throw mapPgError(err, request.log)
 			}
+			request.log.info({ docId: doc.id, total }, 'post_doc ok')
 
 			// Совместимость: пишем в старую таблицу documents тоже
 			await client.query(

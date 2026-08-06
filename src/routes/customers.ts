@@ -71,7 +71,7 @@ export function registerCustomerRoutes(app: FastifyInstance, pool: DbPool) {
 				try {
 					await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 				} catch (err) {
-					throw mapPgError(err)
+					throw mapPgError(err, request.log)
 				}
 			} else {
 				// adjustment → opening_settlement со знаковой суммой
@@ -85,7 +85,7 @@ export function registerCustomerRoutes(app: FastifyInstance, pool: DbPool) {
 				try {
 					await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 				} catch (err) {
-					throw mapPgError(err)
+					throw mapPgError(err, request.log)
 				}
 			}
 

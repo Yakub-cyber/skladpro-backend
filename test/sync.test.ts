@@ -116,7 +116,7 @@ describe('sync', () => {
 				],
 			},
 		})
-		expect(res.statusCode).toBe(200)
+		expect(res.statusCode).toBe(207)
 		const results = res.json().results
 		expect(results.every((r: { ok: boolean }) => !r.ok)).toBe(true)
 	})
@@ -131,7 +131,7 @@ describe('sync', () => {
 			headers: await authHeaders(),
 			payload: { ops: [{ table: 'constructor', op: 'upsert', row: { id: 'x' } }] },
 		})
-		expect(res.statusCode).toBe(200)
+		expect(res.statusCode).toBe(207)
 		expect(res.json().results[0]).toMatchObject({ ok: false, code: 'TABLE_FORBIDDEN' })
 	})
 

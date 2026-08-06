@@ -136,7 +136,7 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 				try {
 					await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 				} catch (err) {
-					throw mapPgError(err)
+					throw mapPgError(err, request.log)
 				}
 
 				// Наличная продажа реальному клиенту: гасим долг мгновенной оплатой
@@ -151,7 +151,7 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					try {
 						await client.query('select post_doc($1,$2)', [auth.companyId, payDocId])
 					} catch (err) {
-						throw mapPgError(err)
+						throw mapPgError(err, request.log)
 					}
 				}
 
@@ -182,7 +182,7 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					try {
 						await client.query('select unpost_doc($1,$2)', [auth.companyId, d.id])
 					} catch (err) {
-						throw mapPgError(err)
+						throw mapPgError(err, request.log)
 					}
 				}
 
