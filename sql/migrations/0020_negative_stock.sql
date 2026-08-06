@@ -17,6 +17,11 @@
 alter table stock_balances drop constraint if exists stock_balances_non_negative;
 alter table products drop constraint if exists products_stock_check;
 
+-- Заменяем сетку от абсурда: потерянный знак или переполнение упадёт,
+-- а нормальный минус от продажи с колёс пройдёт.
+alter table stock_balances add constraint stock_balances_qty_floor check (qty > -1000000);
+alter table products add constraint products_stock_floor check (stock > -1000000);
+
 -- Сносим старую 5-аргументную версию — сигнатура меняется, replace недостаточно.
 drop function if exists apply_stock(uuid, text, text, numeric, numeric);
 
@@ -67,7 +72,11 @@ begin
     end if;
     delta := round(-(qty_from_stock * (cur_cost / cur_qty) + qty_below * last_cost), 4);
   else
-    -- Уже в минусе: FIFO пусто. Вся себестоимость расхода — по last known.
+    -- Уже в минусе (или ноль): FIFO пусто. Себестоимость — по last known.
+    -- Если products.cost = 0 (новинка без прихода), delta будет 0 и
+    -- doc_lines.cost_amount запишется нулевым → прибыль в отчёте завышена.
+    -- Это осознанный компромисс: корректировка придёт с приходом.
+    -- Отчёт фильтрует такие строки по cost_amount = 0 + расходный doc_type.
     select coalesce(cost, 0) into last_cost
       from products where company_id = p_company and id = p_prod;
     delta := round(p_qty * last_cost, 4);

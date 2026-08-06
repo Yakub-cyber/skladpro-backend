@@ -25,8 +25,22 @@ select c.company_id, c.id, c.name, c.balance as mirror, coalesce(s.amount,0) as 
     on s.company_id = c.company_id and s.party_id = c.id
  where c.deleted_at is null and abs(c.balance - coalesce(s.amount,0)) > 0.01;
 
-\echo '=== 3. Отрицательные остатки (информационно — товар продан, приход не проведён) ==='
-select company_id, warehouse_id, product_id, qty from stock_balances where qty < -0.0001;
+\echo '=== 3. Товары в минусе с давностью (приход не проведён) ==='
+-- Минус > 3 дней — скорее всего приход не проведут, фактическая недостача.
+select b.company_id, b.warehouse_id, b.product_id, p.name,
+       b.qty,
+       now() - last_sale.at as negative_since,
+       case when now() - last_sale.at > interval '3 days' then 'STALE' else 'ok' end as status
+  from stock_balances b
+  join products p on p.company_id = b.company_id and p.id = b.product_id
+  left join lateral (
+    select m.at from stock_movements m
+     where m.company_id = b.company_id and m.warehouse_id = b.warehouse_id
+       and m.product_id = b.product_id and m.qty < 0
+     order by m.at desc limit 1
+  ) last_sale on true
+ where b.qty < -0.0001
+ order by b.qty;
 
 \echo '=== 4. Проведённые документы без движений (проведение молча не сработало) ==='
 select d.company_id, d.id, d.doc_type, d.amount
