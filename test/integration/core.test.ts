@@ -305,4 +305,81 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(afterSale + 3)
 		expect(await drift(ctx)).toEqual([])
 	})
+
+	it('ledger_guard: прямой UPDATE products.stock → P0009', async () => {
+		await ctx.pool.query('select install_ledger_guard()')
+		try {
+			await expect(
+				ctx.pool.query(`update products set stock = stock + 1 where company_id=$1 and id=$2`,
+					[ctx.companyId, ctx.ids.product])
+			).rejects.toMatchObject({ code: 'P0009' })
+		} finally {
+			await ctx.pool.query('drop trigger if exists products_ledger_guard on products')
+			await ctx.pool.query('drop trigger if exists customers_ledger_guard on customers')
+			await ctx.pool.query('drop trigger if exists suppliers_ledger_guard on suppliers')
+		}
+	})
+
+	it('ledger_guard: прямой UPDATE customers.balance → P0009', async () => {
+		await ctx.pool.query('select install_ledger_guard()')
+		try {
+			await expect(
+				ctx.pool.query(`update customers set balance = balance + 1 where company_id=$1 and id=$2`,
+					[ctx.companyId, ctx.ids.customer])
+			).rejects.toMatchObject({ code: 'P0009' })
+		} finally {
+			await ctx.pool.query('drop trigger if exists products_ledger_guard on products')
+			await ctx.pool.query('drop trigger if exists customers_ledger_guard on customers')
+			await ctx.pool.query('drop trigger if exists suppliers_ledger_guard on suppliers')
+		}
+	})
+
+	it('ledger_guard: прямой UPDATE suppliers.balance → P0009', async () => {
+		await ctx.pool.query('select install_ledger_guard()')
+		try {
+			await expect(
+				ctx.pool.query(`update suppliers set balance = balance + 1 where company_id=$1 and id=$2`,
+					[ctx.companyId, ctx.ids.supplier])
+			).rejects.toMatchObject({ code: 'P0009' })
+		} finally {
+			await ctx.pool.query('drop trigger if exists products_ledger_guard on products')
+			await ctx.pool.query('drop trigger if exists customers_ledger_guard on customers')
+			await ctx.pool.query('drop trigger if exists suppliers_ledger_guard on suppliers')
+		}
+	})
+
+	it('ledger_guard: UPDATE products.name (не stock) проходит', async () => {
+		await ctx.pool.query('select install_ledger_guard()')
+		try {
+			await ctx.pool.query(`update products set name = 'Тест-переименование' where company_id=$1 and id=$2`,
+				[ctx.companyId, ctx.ids.product])
+			const { rows } = await ctx.pool.query(`select name from products where company_id=$1 and id=$2`,
+				[ctx.companyId, ctx.ids.product])
+			expect(rows[0].name).toBe('Тест-переименование')
+		} finally {
+			await ctx.pool.query('drop trigger if exists products_ledger_guard on products')
+			await ctx.pool.query('drop trigger if exists customers_ledger_guard on customers')
+			await ctx.pool.query('drop trigger if exists suppliers_ledger_guard on suppliers')
+		}
+	})
+
+	it('ledger_guard: post_doc проходит с активным guard', async () => {
+		await ctx.pool.query('select install_ledger_guard()')
+		try {
+			const res = await call(ctx, 'POST', '/v1/documents/post', {
+				document: {
+					id: 'doc-with-guard',
+					type: 'receive',
+					warehouseId: ctx.ids.warehouse,
+					supplierId: ctx.ids.supplier,
+					items: [{ productId: ctx.ids.product, qty: 1, cost: 10 }],
+				},
+			})
+			expect(res.statusCode).toBe(201)
+		} finally {
+			await ctx.pool.query('drop trigger if exists products_ledger_guard on products')
+			await ctx.pool.query('drop trigger if exists customers_ledger_guard on customers')
+			await ctx.pool.query('drop trigger if exists suppliers_ledger_guard on suppliers')
+		}
+	})
 })
