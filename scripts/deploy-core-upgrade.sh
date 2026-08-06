@@ -27,6 +27,7 @@ if [[ -z "$STEP" || -z "$SSH_TARGET" ]]; then
   echo "Использование:" >&2
   echo "  $0 sync    root@<host>   # шаг 1: копировать файлы + reconcile" >&2
   echo "  $0 migrate root@<host>   # шаг 2: миграции + рестарт + reconcile" >&2
+  echo "  $0 quick   root@<host>   # только JS: бандл → dist.prev → rsync → рестарт → health" >&2
   exit 1
 fi
 
@@ -61,6 +62,12 @@ REMOTE
       || echo "⚠ pg_restore --list не прошёл — проверь дамп вручную"
 
     echo "== rsync файлов (БЕЗ миграций и рестарта) =="
+    ssh "$SSH_TARGET" bash <<'REMOTE'
+set -euo pipefail
+cd /opt/skladpro-backend
+[ -d dist ] && rm -rf dist.prev && cp -a dist dist.prev && echo "dist.prev сохранён"
+REMOTE
+
     rsync -avz --delete \
       --exclude='.git' --exclude='node_modules' --exclude='test' \
       dist package.json package-lock.json sql \
@@ -111,11 +118,19 @@ systemctl status skladpro-api --no-pager --lines=8
 REMOTE
 
     echo ""
-    echo "== Health check =="
-    HOST_ONLY="${SSH_TARGET#*@}"
-    curl -fsS --max-time 10 "http://${HOST_ONLY}/health" \
-      && echo "  ok" \
-      || echo "  ⚠ /health не ответил"
+    echo "== Health check (порт 8787) =="
+    ssh "$SSH_TARGET" bash <<'REMOTE'
+set -euo pipefail
+for i in 1 2 3 4 5; do
+  if curl -fsS --max-time 5 http://localhost:8787/health; then
+    echo "  ok"
+    exit 0
+  fi
+  sleep 2
+done
+echo "  ⚠ /health не ответил после 5 попыток" >&2
+exit 1
+REMOTE
 
     echo ""
     echo "== Reconcile повторно =="
@@ -138,8 +153,37 @@ REMOTE
     echo "════════════════════════════════════════════════════════"
     ;;
 
+  quick)
+    echo "== Quick deploy (только JS, без миграций) =="
+    npm run build
+
+    echo "== Сборка бандла =="
+    tar -czf deploy-bundle.tar.gz dist package.json package-lock.json sql
+    scp deploy-bundle.tar.gz "$SSH_TARGET:/tmp/deploy-bundle.tar.gz"
+    rm deploy-bundle.tar.gz
+
+    ssh "$SSH_TARGET" bash <<'REMOTE'
+set -euo pipefail
+cd /opt/skladpro-backend
+[ -d dist ] && rm -rf dist.prev && cp -a dist dist.prev && echo "dist.prev сохранён"
+tar -xzf /tmp/deploy-bundle.tar.gz
+chown -R skladpro:skladpro dist sql
+rm /tmp/deploy-bundle.tar.gz
+systemctl restart skladpro-api
+for i in 1 2 3 4 5; do
+  if curl -fsS --max-time 5 http://localhost:8787/health; then
+    echo "  ok"
+    exit 0
+  fi
+  sleep 2
+done
+echo "  ⚠ /health не ответил" >&2
+exit 1
+REMOTE
+    ;;
+
   *)
-    echo "Неизвестный шаг: $STEP (допустимые: sync, migrate)" >&2
+    echo "Неизвестный шаг: $STEP (допустимые: sync, migrate, quick)" >&2
     exit 1
     ;;
 esac
