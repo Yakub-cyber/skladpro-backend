@@ -91,6 +91,35 @@ export async function makeTestApp(opts: {
 	return { app, log, companyId: opts.membership?.company_id ?? COMPANY_ID }
 }
 
+/**
+ * Общий мок для запросов учётного ядра (docs/post_doc/warehouses/money_accounts).
+ * Без этого роуты падают на select post_doc / warehouse lookup.
+ */
+export function coreHandler(opts: {
+	postDocTotal?: number
+	throwOnPostDoc?: { code: string; message: string }
+	afterBalance?: number
+} = {}) {
+	return (sql: string, _params: unknown[]): unknown[] | undefined => {
+		if (sql.includes('from warehouses') && sql.includes('deleted_at is null'))
+			return [{ id: 'wh-default' }]
+		if (sql.includes('from money_accounts'))
+			return [{ id: 'acc-default' }]
+		if (sql.includes('post_doc') || sql.includes('unpost_doc')) {
+			if (opts.throwOnPostDoc) {
+				throw Object.assign(new Error(opts.throwOnPostDoc.message), { code: opts.throwOnPostDoc.code })
+			}
+			return [{ post_doc: opts.postDocTotal ?? 0, total: opts.postDocTotal ?? 0 }]
+		}
+		if (sql.includes('from docs') && sql.includes('for update'))
+			return [{ id: 'doc-existing' }]
+		// Re-read balance after post_doc (customers.ts)
+		if (sql.startsWith('select balance from customers'))
+			return [{ balance: opts.afterBalance ?? 0 }]
+		return undefined
+	}
+}
+
 export async function authHeaders(overrides: Record<string, string> = {}) {
 	const token = await tokens.signAccessToken({ sub: USER_ID, email: 'test@example.com', name: 'Тест' })
 	return { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...overrides }

@@ -40,7 +40,7 @@ describe('приложение', () => {
 	it('внутренняя ошибка не раскрывает детали', async () => {
 		const { app } = await makeTestApp({
 			handler: sql => {
-				if (sql.includes('for update')) throw new Error('secret sql failure at line 42')
+				if (sql.includes('from products') && sql.includes('deleted_at is null')) throw new Error('secret sql failure at line 42')
 				return undefined
 			},
 		})

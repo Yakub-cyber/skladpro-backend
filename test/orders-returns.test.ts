@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { authHeaders, COMPANY_ID, makeTestApp } from './helpers.js'
+import { authHeaders, COMPANY_ID, coreHandler, makeTestApp } from './helpers.js'
 
 type OrderRow = {
 	id: string
@@ -10,26 +10,30 @@ type OrderRow = {
 	returns?: unknown[]
 	items: unknown[]
 	assigned_to?: string | null
+	on_credit?: boolean
+	customer_id?: string | null
 }
 
-function handlerWith(order: OrderRow, stock: Record<string, { qty: number; cost?: number; batches?: unknown[] }>) {
+function handlerWith(order: OrderRow, postDocOpts?: Parameters<typeof coreHandler>[0]) {
+	const core = coreHandler(postDocOpts)
 	return (sql: string, params: unknown[]): unknown[] | undefined => {
-		if (sql.includes('from orders') && sql.includes('for update')) return params[1] === order.id ? [order] : []
-		if (sql.includes('from products') && sql.includes('for update')) {
-			const id = params[1] as string
-			const p = stock[id]
-			return p ? [{ id, name: `Товар ${id}`, stock: p.qty, cost: p.cost ?? 0, batches: p.batches ?? [] }] : []
-		}
+		if (sql.includes('from orders') && sql.includes('for update'))
+			return params[1] === order.id ? [order] : []
+		const c = core(sql, params)
+		if (c !== undefined) return c
+		// Returns: products query for mark codes
+		if (sql.includes('from products') && sql.includes('deleted_at is null'))
+			return [{ name: 'Товар', marked: false, codes: [] }]
 		return undefined
 	}
 }
 
 describe('POST /v1/orders/:id/status', () => {
-	const items = [{ productId: 'p-1', qty: 2, name: 'Товар' }]
+	const items = [{ productId: 'p-1', qty: 2, name: 'Товар', price: 100 }]
 
-	it('shipped: списывает остаток и ставит stock_consumed', async () => {
+	it('shipped: создаёт doc + doc_lines + post_doc, ставит stock_consumed', async () => {
 		const { app, log } = await makeTestApp({
-			handler: handlerWith({ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items }, { 'p-1': { qty: 5 } }),
+			handler: handlerWith({ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items }),
 		})
 		const res = await app.inject({
 			method: 'POST',
@@ -38,14 +42,19 @@ describe('POST /v1/orders/:id/status', () => {
 			payload: { status: 'shipped' },
 		})
 		expect(res.statusCode).toBe(200)
-		// В новом коде списание идёт как `stock = stock - $3` (не +/-1).
-		expect(log.some(e => e.sql.includes('update products set stock = stock - $3') && e.params[2] === 2)).toBe(true)
-		expect(log.some(e => e.sql.includes('set stock_consumed = true'))).toBe(true)
+		const sqls = log.map(e => e.sql)
+		expect(sqls.some(s => s.includes('insert into docs'))).toBe(true)
+		expect(sqls.some(s => s.includes('insert into doc_lines'))).toBe(true)
+		expect(sqls.some(s => s.includes('post_doc'))).toBe(true)
+		expect(sqls.some(s => s.includes('set stock_consumed = true'))).toBe(true)
 	})
 
-	it('shipped при нехватке остатка → 409', async () => {
+	it('shipped при нехватке остатка → post_doc бросает P0001 → 409', async () => {
 		const { app } = await makeTestApp({
-			handler: handlerWith({ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items }, { 'p-1': { qty: 1 } }),
+			handler: handlerWith(
+				{ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items },
+				{ throwOnPostDoc: { code: 'P0001', message: 'Недостаточно остатка' } },
+			),
 		})
 		const res = await app.inject({
 			method: 'POST',
@@ -54,13 +63,13 @@ describe('POST /v1/orders/:id/status', () => {
 			payload: { status: 'shipped' },
 		})
 		expect(res.statusCode).toBe(409)
+		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
 	})
 
-	it('cancelled после отгрузки возвращает остаток', async () => {
+	it('cancelled после отгрузки: находит docs + unpost_doc', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '1', status: 'shipped', stock_consumed: true, returns: [], items },
-				{ 'p-1': { qty: 0 } },
 			),
 		})
 		const res = await app.inject({
@@ -70,24 +79,16 @@ describe('POST /v1/orders/:id/status', () => {
 			payload: { status: 'cancelled' },
 		})
 		expect(res.statusCode).toBe(200)
-		expect(log.some(e => e.sql.includes('update products set stock = stock + $3') && e.params[2] === 2)).toBe(true)
-		expect(log.some(e => e.sql.includes('set stock_consumed = false'))).toBe(true)
+		const sqls = log.map(e => e.sql)
+		expect(sqls.some(s => s.includes('from docs') && s.includes('for update'))).toBe(true)
+		expect(sqls.some(s => s.includes('unpost_doc'))).toBe(true)
+		expect(sqls.some(s => s.includes('set stock_consumed = false'))).toBe(true)
 	})
 
-	it('cancelled после ЧАСТИЧНОГО возврата НЕ возвращает уже возвращённые единицы', async () => {
-		// Продано 2 шт p-1, 1 шт уже возвращён через /v1/returns → отмена
-		// должна вернуть только 1 оставшуюся, а не 2 (иначе +1 фантом на складе).
+	it('cancelled без отгрузки не вызывает unpost_doc', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
-				{
-					id: 'o-1',
-					no: '1',
-					status: 'shipped',
-					stock_consumed: true,
-					returns: [{ at: 'x', by: 'y', items: [{ productId: 'p-1', qty: 1 }] }],
-					items,
-				},
-				{ 'p-1': { qty: 0 } },
+				{ id: 'o-1', no: '1', status: 'confirmed', stock_consumed: false, items },
 			),
 		})
 		const res = await app.inject({
@@ -97,14 +98,12 @@ describe('POST /v1/orders/:id/status', () => {
 			payload: { status: 'cancelled' },
 		})
 		expect(res.statusCode).toBe(200)
-		const restocks = log.filter(e => e.sql.includes('update products set stock = stock + $3'))
-		expect(restocks).toHaveLength(1)
-		expect(restocks[0]!.params[2]).toBe(1) // только 1 оставшаяся, не 2
+		expect(log.some(e => e.sql.includes('unpost_doc'))).toBe(false)
 	})
 
 	it('запрещённый переход delivered → new отклоняется', async () => {
 		const { app } = await makeTestApp({
-			handler: handlerWith({ id: 'o-1', no: '1', status: 'delivered', stock_consumed: true, items }, {}),
+			handler: handlerWith({ id: 'o-1', no: '1', status: 'delivered', stock_consumed: true, items }),
 		})
 		const res = await app.inject({
 			method: 'POST',
@@ -120,7 +119,6 @@ describe('POST /v1/orders/:id/status', () => {
 			makeTestApp({
 				handler: handlerWith(
 					{ id: 'o-1', no: '1', status: 'shipped', stock_consumed: true, items, assigned_to: assignedTo },
-					{},
 				),
 				membership: { company_id: COMPANY_ID, role: 'courier', name: 'Вася' },
 			})
@@ -146,7 +144,6 @@ describe('POST /v1/orders/:id/status', () => {
 		const { app } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '1', status: 'shipped', stock_consumed: true, items, assigned_to: null },
-				{},
 			),
 			membership: { company_id: COMPANY_ID, role: 'courier', name: null },
 		})
@@ -162,15 +159,14 @@ describe('POST /v1/orders/:id/status', () => {
 
 describe('POST /v1/returns', () => {
 	const soldItems = [
-		{ productId: 'p-1', qty: 2, name: 'А' },
-		{ productId: 'p-2', qty: 1, name: 'Б' },
+		{ productId: 'p-1', qty: 2, name: 'А', price: 100 },
+		{ productId: 'p-2', qty: 1, name: 'Б', price: 200 },
 	]
 
-	it('полный возврат: restock всех позиций, returned=true', async () => {
+	it('полный возврат: создаёт sales_return + post_doc, returned=true', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [], items: soldItems },
-				{ 'p-1': { qty: 0 }, 'p-2': { qty: 0 } },
 			),
 		})
 		const res = await app.inject({
@@ -181,8 +177,11 @@ describe('POST /v1/returns', () => {
 		})
 		expect(res.statusCode).toBe(201)
 		expect(res.json().fullyReturned).toBe(true)
-		const restocks = log.filter(e => e.sql.includes('update products set stock = stock + $3'))
-		expect(restocks).toHaveLength(2)
+
+		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
+		expect(docsInsert.sql).toContain('sales_return')
+		expect(log.filter(e => e.sql.includes('insert into doc_lines')).length).toBe(2)
+		expect(log.some(e => e.sql.includes('post_doc'))).toBe(true)
 		expect(log.some(e => e.sql.includes('update orders set returns') && e.params[3] === true)).toBe(true)
 	})
 
@@ -190,7 +189,6 @@ describe('POST /v1/returns', () => {
 		const { app } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [], items: soldItems },
-				{ 'p-1': { qty: 0 } },
 			),
 		})
 		const res = await app.inject({
@@ -216,7 +214,6 @@ describe('POST /v1/returns', () => {
 					returns: [{ at: 'x', by: 'y', items: [{ productId: 'p-1', qty: 1 }] }],
 					items: soldItems,
 				},
-				{ 'p-1': { qty: 0 } },
 			),
 		})
 		const res = await app.inject({
@@ -232,7 +229,6 @@ describe('POST /v1/returns', () => {
 		const { app } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: true, returns: [], items: soldItems },
-				{},
 			),
 		})
 		const res = await app.inject({
@@ -244,7 +240,7 @@ describe('POST /v1/returns', () => {
 		expect(res.statusCode).toBe(400)
 	})
 
-	it('возврат заказа on_credit — уменьшает customers.balance на сумму возвращённых позиций', async () => {
+	it('возврат заказа on_credit — создаёт sales_return с party_kind=customer', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{
@@ -255,25 +251,23 @@ describe('POST /v1/returns', () => {
 					],
 					on_credit: true,
 					customer_id: 'cu-42',
-				} as OrderRow & { on_credit: boolean; customer_id: string },
-				{ 'p-1': { qty: 0 }, 'p-2': { qty: 0 } },
+				},
 			),
 		})
 		const res = await app.inject({
 			method: 'POST',
 			url: '/v1/returns',
 			headers: await authHeaders({ 'idempotency-key': 'return-oncredit-01' }),
-			// Возвращаем 1 шт p-1 (по 300) → долг −300
 			payload: { orderId: 'o-1', items: [{ productId: 'p-1', qty: 1 }] },
 		})
 		expect(res.statusCode).toBe(201)
-		const balUpd = log.find(e => e.sql.includes('update customers set balance = greatest(0, coalesce(balance, 0) - $3)'))
-		expect(balUpd).toBeTruthy()
-		expect(balUpd!.params[1]).toBe('cu-42')
-		expect(balUpd!.params[2]).toBe(300)
+		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
+		expect(docsInsert.sql).toContain('sales_return')
+		expect(docsInsert.params).toContain('customer')
+		expect(docsInsert.params).toContain('cu-42')
 	})
 
-	it('возврат заказа НЕ on_credit — customers.balance не трогается', async () => {
+	it('возврат заказа НЕ on_credit — party=null', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{
@@ -281,8 +275,7 @@ describe('POST /v1/returns', () => {
 					items: [{ productId: 'p-1', qty: 1, name: 'А', price: 300 }],
 					on_credit: false,
 					customer_id: 'cu-42',
-				} as OrderRow & { on_credit: boolean; customer_id: string },
-				{ 'p-1': { qty: 0 } },
+				},
 			),
 		})
 		await app.inject({
@@ -291,18 +284,19 @@ describe('POST /v1/returns', () => {
 			headers: await authHeaders({ 'idempotency-key': 'return-cash-01' }),
 			payload: { orderId: 'o-1' },
 		})
-		expect(log.some(e => e.sql.includes('update customers set balance'))).toBe(false)
+		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
+		expect(docsInsert.sql).toContain('sales_return')
+		// party_kind and party_id should be null for non-credit
+		expect(docsInsert.params).toContain(null)
 	})
 
-	it('возврат восстанавливает FIFO-партию (batches получает +qty)', async () => {
+	it('полный возврат вызывает post_doc, не ручное обновление stock', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{
 					id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [],
-					// Продано 1 шт p-1 по себестоимости 40 (из order.items)
 					items: [{ productId: 'p-1', qty: 1, name: 'А', cost: 40 }],
 				},
-				{ 'p-1': { qty: 0, cost: 55, batches: [] } },
 			),
 		})
 		const res = await app.inject({
@@ -312,9 +306,8 @@ describe('POST /v1/returns', () => {
 			payload: { orderId: 'o-1' },
 		})
 		expect(res.statusCode).toBe(201)
-		// batches обновились: новая партия по себестоимости продажи (40, не 55)
-		const upd = log.find(e => e.sql.includes('update products set stock = stock + $3'))!
-		const batches = JSON.parse(String(upd.params[3]))
-		expect(batches[0]).toMatchObject({ qty: 1, cost: 40 })
+		expect(log.some(e => e.sql.includes('post_doc'))).toBe(true)
+		// Нет ручных update products
+		expect(log.some(e => e.sql.includes('update products set stock'))).toBe(false)
 	})
 })

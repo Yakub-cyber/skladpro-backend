@@ -1,19 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { authHeaders, COMPANY_ID, makeTestApp } from './helpers.js'
-
-function productHandler(p: { id: string; name: string; stock: number; marked: boolean; codes?: string[] } | null) {
-	return (sql: string, params: unknown[]): unknown[] | undefined => {
-		if (sql.includes('from products') && sql.includes('for update')) {
-			if (!p || params[1] !== p.id) return []
-			return [{
-				id: p.id, name: p.name, stock: p.stock, cost: 0, batches: [],
-				marked: p.marked, codes: p.codes ?? [],
-			}]
-		}
-		if (sql.includes('insert into orders') && sql.includes('returning id')) return [{ id: params[1] }]
-		return undefined
-	}
-}
+import { authHeaders, COMPANY_ID, coreHandler, makeTestApp } from './helpers.js'
 
 describe('POST /v1/products/:id/mark-codes — приёмка/коррекция', () => {
 	it('add: новые коды добавляются в пул, дубликаты игнорируются', async () => {
@@ -58,7 +44,7 @@ describe('POST /v1/products/:id/mark-codes — приёмка/коррекция
 			method: 'POST',
 			url: '/v1/products/p-1/mark-codes',
 			headers: await authHeaders({ 'idempotency-key': 'mc-rm-01' }),
-			payload: { action: 'remove', codes: ['B', 'Z'] }, // Z нет в пуле — молча пропускаем
+			payload: { action: 'remove', codes: ['B', 'Z'] },
 		})
 		expect(res.statusCode).toBe(201)
 		expect(res.json()).toMatchObject({ action: 'remove', added: 0, removed: 1, poolSize: 2 })
@@ -87,7 +73,7 @@ describe('POST /v1/products/:id/mark-codes — приёмка/коррекция
 		})
 		const res = await app.inject({
 			method: 'POST',
-			url: '/v1/products/p-nope/mark-codes',
+			url: '/v1/products/p-1/mark-codes',
 			headers: await authHeaders({ 'idempotency-key': 'mc-404-01' }),
 			payload: { action: 'add', codes: ['X'] },
 		})
@@ -112,13 +98,16 @@ describe('POST /v1/products/:id/mark-codes — приёмка/коррекция
 describe('POST /v1/sales — items.markCodes', () => {
 	it('продажа со сканированными КМ снимает именно их из пула', async () => {
 		let savedCodes: unknown = null
+		const core = coreHandler()
 		const { app } = await makeTestApp({
 			handler: (sql, params) => {
-				if (sql.includes('from products') && sql.includes('for update'))
-					return [{ id: params[1], name: 'Пиво', stock: 10, cost: 0, batches: [], marked: true, codes: ['A', 'B', 'C'] }]
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				if (sql.includes('from products') && sql.includes('deleted_at is null'))
+					return [{ name: 'Пиво', marked: true, codes: ['A', 'B', 'C'] }]
 				if (sql.includes('insert into orders') && sql.includes('returning id')) return [{ id: params[1] }]
-				if (sql.includes('update products set stock = stock - $3, batches = $4, codes = $5')) {
-					savedCodes = params[4]
+				if (sql.includes('update products set codes')) {
+					savedCodes = params[2]
 					return []
 				}
 				return undefined
@@ -137,14 +126,17 @@ describe('POST /v1/sales — items.markCodes', () => {
 		})
 		expect(res.statusCode).toBe(201)
 		const stored = JSON.parse(String(savedCodes))
-		expect(stored).toEqual(['A']) // 'B','C' сняты
+		expect(stored).toEqual(['A'])
 	})
 
 	it('markCodes на немаркированном товаре → 400', async () => {
+		const core = coreHandler()
 		const { app } = await makeTestApp({
 			handler: (sql, params) => {
-				if (sql.includes('from products') && sql.includes('for update'))
-					return [{ id: params[1], name: 'Обычный', stock: 10, cost: 0, batches: [], marked: false, codes: [] }]
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				if (sql.includes('from products') && sql.includes('deleted_at is null'))
+					return [{ name: 'Обычный', marked: false, codes: [] }]
 				return undefined
 			},
 		})
@@ -163,8 +155,16 @@ describe('POST /v1/sales — items.markCodes', () => {
 	})
 
 	it('markCodes отсутствуют в пуле → 409 MARK_CODE_NOT_IN_POOL', async () => {
+		const core = coreHandler()
 		const { app } = await makeTestApp({
-			handler: productHandler({ id: 'p-1', name: 'Пиво', stock: 10, marked: true, codes: ['A', 'B'] }),
+			handler: (sql, params) => {
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				if (sql.includes('from products') && sql.includes('deleted_at is null'))
+					return [{ name: 'Пиво', marked: true, codes: ['A', 'B'] }]
+				if (sql.includes('insert into orders') && sql.includes('returning id')) return [{ id: params[1] }]
+				return undefined
+			},
 		})
 		const res = await app.inject({
 			method: 'POST',
@@ -183,8 +183,16 @@ describe('POST /v1/sales — items.markCodes', () => {
 	})
 
 	it('дубликаты в markCodes → 400', async () => {
+		const core = coreHandler()
 		const { app } = await makeTestApp({
-			handler: productHandler({ id: 'p-1', name: 'Пиво', stock: 10, marked: true, codes: ['A', 'B'] }),
+			handler: (sql, params) => {
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				if (sql.includes('from products') && sql.includes('deleted_at is null'))
+					return [{ name: 'Пиво', marked: true, codes: ['A', 'B'] }]
+				if (sql.includes('insert into orders') && sql.includes('returning id')) return [{ id: params[1] }]
+				return undefined
+			},
 		})
 		const res = await app.inject({
 			method: 'POST',
@@ -202,13 +210,16 @@ describe('POST /v1/sales — items.markCodes', () => {
 
 	it('маркированный товар БЕЗ явных markCodes — снимаем первые N (совместимость)', async () => {
 		let savedCodes: unknown = null
+		const core = coreHandler()
 		const { app } = await makeTestApp({
 			handler: (sql, params) => {
-				if (sql.includes('from products') && sql.includes('for update'))
-					return [{ id: params[1], name: 'Пиво', stock: 10, cost: 0, batches: [], marked: true, codes: ['A', 'B', 'C', 'D'] }]
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				if (sql.includes('from products') && sql.includes('deleted_at is null'))
+					return [{ name: 'Пиво', marked: true, codes: ['A', 'B', 'C', 'D'] }]
 				if (sql.includes('insert into orders') && sql.includes('returning id')) return [{ id: params[1] }]
-				if (sql.includes('update products set stock = stock - $3, batches = $4, codes = $5')) {
-					savedCodes = params[4]
+				if (sql.includes('update products set codes')) {
+					savedCodes = params[2]
 					return []
 				}
 				return undefined
@@ -226,7 +237,6 @@ describe('POST /v1/sales — items.markCodes', () => {
 			},
 		})
 		expect(res.statusCode).toBe(201)
-		// Первые 2 (A, B) сняты; остаток C, D.
 		expect(JSON.parse(String(savedCodes))).toEqual(['C', 'D'])
 	})
 })

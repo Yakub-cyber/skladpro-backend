@@ -28,8 +28,15 @@ describe('super-admin: /v1/admin/stats', () => {
 				if (sql.startsWith('select count(*)::int as n from memberships where active')) return [{ n: 12 }]
 				if (sql.startsWith('select count(*)::int as n from invitations')) return [{ n: 1 }]
 				if (sql.startsWith('select pg_database_size')) return [{ bytes: '34567890' }]
-				if (sql.includes("interval '24 hours'")) return [{ orders: 5, revenue: '15000' }]
-				if (sql.includes("interval '30 days'")) return [{ orders: 80, revenue: '250000' }]
+				if (sql.includes("interval '24 hours'") && sql.includes('from orders')) return [{ orders: 5, revenue: '15000' }]
+				if (sql.includes("interval '30 days'") && sql.includes('from orders')) return [{ orders: 80, revenue: '250000' }]
+				if (sql.includes('from subscriptions') && sql.includes('group by plan')) return []
+				if (sql.includes('from subscriptions') && sql.includes('trial')) return [{ n: 0 }]
+				if (sql.includes('from subscription_payments')) return [{ total: '0' }]
+				if (sql.includes('companies_7d')) return [{ companies_7d: 1, companies_30d: 2 }]
+				if (sql.includes('from security_events') && sql.includes('dau')) return [{ dau: 3, mau: 5 }]
+				if (sql.includes('from security_events') && sql.includes('login_ok')) return [{ login_ok: 10, login_fail: 2, reuse: 0 }]
+				if (sql.includes('from users where active') && sql.includes('7 days')) return [{ w: 1, m: 3 }]
 				return undefined
 			}),
 		})
