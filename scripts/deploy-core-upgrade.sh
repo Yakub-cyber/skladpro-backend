@@ -40,17 +40,25 @@ case "$STEP" in
     npm run build
 
     echo "== Бэкап (pg_dump) =="
-    ssh "$SSH_TARGET" bash <<'REMOTE'
+    DUMP_NAME="skladpro-$(date +%F-%H%M).dump"
+    ssh "$SSH_TARGET" bash <<REMOTE
 set -euo pipefail
-DUMP="/opt/skladpro-backend/backup-$(date +%F-%H%M).dump"
-sudo -u skladpro pg_dump -Fc -d skladpro -f "$DUMP"
-SIZE=$(stat -c%s "$DUMP")
-echo "Бэкап: $DUMP ($SIZE байт)"
-if [ "$SIZE" -lt 1000 ]; then
+DUMP="/var/backups/${DUMP_NAME}"
+sudo -u skladpro pg_dump -Fc -d skladpro -f "\$DUMP"
+SIZE=\$(stat -c%s "\$DUMP")
+echo "Бэкап: \$DUMP (\$SIZE байт)"
+if [ "\$SIZE" -lt 1000 ]; then
   echo "ОШИБКА: бэкап подозрительно маленький, прерываю." >&2
   exit 1
 fi
 REMOTE
+
+    echo "== Скачиваем дамп локально =="
+    scp "$SSH_TARGET:/var/backups/${DUMP_NAME}" "./${DUMP_NAME}"
+    echo "Локальная копия: ./${DUMP_NAME}"
+    pg_restore --list "./${DUMP_NAME}" | head -5 \
+      && echo "pg_restore --list: дамп читается" \
+      || echo "⚠ pg_restore --list не прошёл — проверь дамп вручную"
 
     echo "== rsync файлов (БЕЗ миграций и рестарта) =="
     rsync -avz --delete \
