@@ -109,7 +109,8 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 			}
 
 			const docId = `sale-${order.id}`
-			const docType = isCredit ? 'sales_shipment' : 'retail_receipt'
+			const docType = isRetail ? 'retail_receipt' : 'sales_shipment'
+			const hasParty = !isRetail
 
 			await client.query(
 				`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id,
@@ -117,8 +118,8 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 				[
 					auth.companyId, docId, docType, warehouseId,
-					isCredit ? 'customer' : null,
-					isCredit ? order.customerId : null,
+					hasParty ? 'customer' : null,
+					hasParty ? order.customerId : null,
 					accountId,
 					order.priceTypeId ?? null,
 					order.id,
@@ -143,6 +144,22 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 			} catch (err) {
 				throw mapPgError(err)
+			}
+
+			// Наличная продажа реальному клиенту: sales_shipment создал долг,
+			// payment_in тут же гасит его и кладёт деньги в кассу.
+			if (!isCredit && !isRetail) {
+				const payDocId = `pay-${order.id}`
+				await client.query(
+					`insert into docs (company_id, id, doc_type, party_kind, party_id, account_id, amount, "by")
+					 values ($1,$2,'payment_in','customer',$3,$4,$5,$6)`,
+					[auth.companyId, payDocId, order.customerId, accountId, total, actor],
+				)
+				try {
+					await client.query('select post_doc($1,$2)', [auth.companyId, payDocId])
+				} catch (err) {
+					throw mapPgError(err)
+				}
 			}
 
 			// Коды маркировки: списываем из products.codes

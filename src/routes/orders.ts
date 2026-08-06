@@ -19,7 +19,7 @@ const TRANSITIONS: Record<string, string[]> = {
 	picking: ['packed', 'shipped', 'cancelled'],
 	packed: ['shipped', 'cancelled'],
 	shipped: ['delivered', 'cancelled'],
-	delivered: [],
+	delivered: ['cancelled'],
 	cancelled: [],
 }
 
@@ -81,11 +81,14 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 			const warehouseId = whs[0]?.id ?? null
 
 			const isCredit = order.on_credit && order.customer_id && order.customer_id !== 'retail'
+			const hasParty = !!order.customer_id && order.customer_id !== 'retail'
+
+			const isRetail = !order.customer_id || order.customer_id === 'retail'
 
 			// shipped: создаём документ отгрузки
 			if (nextStatus === 'shipped' && !order.stock_consumed) {
 				const docId = `ship-${orderId}`
-				const docType = isCredit ? 'sales_shipment' : 'retail_receipt'
+				const docType = isRetail ? 'retail_receipt' : 'sales_shipment'
 
 				let accountId: string | null = null
 				if (!isCredit) {
@@ -102,8 +105,8 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 					[
 						auth.companyId, docId, docType, warehouseId,
-						isCredit ? 'customer' : null,
-						isCredit ? order.customer_id : null,
+						hasParty ? 'customer' : null,
+						hasParty ? order.customer_id : null,
 						accountId,
 						orderId,
 						actor,
@@ -134,6 +137,22 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					await client.query('select post_doc($1,$2)', [auth.companyId, docId])
 				} catch (err) {
 					throw mapPgError(err)
+				}
+
+				// Наличная продажа реальному клиенту: гасим долг мгновенной оплатой
+				if (!isCredit && !isRetail) {
+					const orderTotal = [...totals.values()].reduce((s, t) => s + t.qty * t.price, 0)
+					const payDocId = `pay-${orderId}`
+					await client.query(
+						`insert into docs (company_id, id, doc_type, party_kind, party_id, account_id, amount, "by")
+						 values ($1,$2,'payment_in','customer',$3,$4,$5,$6)`,
+						[auth.companyId, payDocId, order.customer_id, accountId, Math.round(orderTotal * 100) / 100, actor],
+					)
+					try {
+						await client.query('select post_doc($1,$2)', [auth.companyId, payDocId])
+					} catch (err) {
+						throw mapPgError(err)
+					}
 				}
 
 				await client.query(`update orders set stock_consumed = true where company_id = $1 and id = $2`, [

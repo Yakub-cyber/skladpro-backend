@@ -73,7 +73,7 @@ const PULL_TABLES = Object.freeze([
 	'price_types', 'warehouses', 'cells', 'products', 'customers', 'suppliers',
 	'employees', 'orders', 'invoices', 'documents', 'movements', 'shifts', 'audit',
 	'docs', 'doc_lines', 'product_units', 'money_accounts', 'stock_balances',
-	'product_aliases', 'doc_counters',
+	'product_aliases',
 ] as const)
 const PULL_TABLES_SET = new Set(PULL_TABLES)
 
