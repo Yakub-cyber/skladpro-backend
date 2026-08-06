@@ -1,0 +1,219 @@
+import { randomUUID } from 'node:crypto'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { call, cash, debt, drift, hasDb, setupIntegration, stockAt, type Ctx } from './helpers.js'
+
+/**
+ * Сквозной тест учётного ядра на живой базе.
+ * Проверяет ЦИФРЫ после операций, а не текст SQL-запросов.
+ */
+describe.skipIf(!hasDb)('учётное ядро на живой базе', () => {
+	let ctx: Ctx
+
+	beforeAll(async () => { ctx = await setupIntegration() })
+	afterAll(async () => { await ctx?.close() })
+
+	it('приход в упаковках пересчитывается в штуки и создаёт долг поставщику', async () => {
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-in-1',
+				type: 'receive',
+				warehouseId: ctx.ids.warehouse,
+				supplierId: ctx.ids.supplier,
+				items: [{ productId: ctx.ids.product, qty: 10, cost: 30, unitId: ctx.ids.unitPack, unitFactor: 12 }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+
+		// 10 упаковок по 12 = 120 штук, 120 × 30 = 3600
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(120)
+		expect(await debt(ctx, 'supplier', ctx.ids.supplier)).toBe(-3600)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('продажа в долг списывает товар и увеличивает долг клиента', async () => {
+		const res = await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-1',
+				customerId: ctx.ids.customer,
+				onCredit: true,
+				discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 20, price: 50 }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(100)
+		expect(await debt(ctx, 'customer', ctx.ids.customer)).toBe(1000)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('себестоимость списания считается по средней, а не по цене продажи', async () => {
+		const { rows } = await ctx.pool.query(
+			`select cost_amount from doc_lines where company_id=$1 and doc_id='sale-order-1'`,
+			[ctx.companyId])
+		expect(Number(rows[0].cost_amount)).toBe(600) // 20 шт × 30
+	})
+
+	it('оплата гасит долг и кладёт деньги в кассу', async () => {
+		const res = await call(ctx, 'POST', `/v1/customers/${ctx.ids.customer}/payments`, {
+			amount: 600, kind: 'payment',
+		})
+		expect(res.statusCode).toBeLessThan(300)
+
+		expect(await debt(ctx, 'customer', ctx.ids.customer)).toBe(400)
+		expect(await cash(ctx, ctx.ids.account)).toBe(600)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('продажа за наличные реальному клиенту НЕ теряет контрагента', async () => {
+		await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-cash',
+				customerId: ctx.ids.customer,
+				onCredit: false,
+				discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 5, price: 50 }],
+			},
+		})
+
+		const { rows } = await ctx.pool.query(
+			`select doc_type, party_kind, party_id from docs where company_id=$1 and order_id='order-cash'`,
+			[ctx.companyId])
+
+		expect(rows[0]?.doc_type).toBe('sales_shipment')
+		expect(rows[0]?.party_id).toBe(ctx.ids.customer)
+
+		const { rows: mv } = await ctx.pool.query(
+			`select count(*) c from settlement_movements
+			  where company_id=$1 and doc_id in (select id from docs where company_id=$1 and order_id='order-cash')`,
+			[ctx.companyId])
+		expect(Number(mv[0].c)).toBeGreaterThan(0)
+
+		expect(await cash(ctx, ctx.ids.account)).toBeGreaterThan(0)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('возврат уменьшает долг и может увести его в минус (предоплата не пропадает)', async () => {
+		const res = await call(ctx, 'POST', '/v1/returns', {
+			orderId: 'order-1',
+			items: [{ productId: ctx.ids.product, qty: 20 }],
+			reason: 'тест',
+		})
+		expect(res.statusCode).toBeLessThan(300)
+
+		// Клиент был должен 400, вернул товар на 1000 → теперь МЫ должны 600.
+		expect(await debt(ctx, 'customer', ctx.ids.customer)).toBeLessThan(0)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('отгрузка сверх остатка проходит и честно уводит склад в минус', async () => {
+		// Работа опта: физически товар приехал, продали с колёс, накладную
+		// от поставщика оператор проведёт позже. Минус — сигнал «есть
+		// непроведённый приход», а не блокировка отгрузки.
+		const before = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const res = await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-oversold',
+				customerId: ctx.ids.customer,
+				onCredit: true,
+				discount: 0,
+				items: [{ productId: ctx.ids.product, qty: before + 30, price: 50 }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(-30)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('приход, закрывающий минус, восстанавливает среднюю по last known', async () => {
+		// Ожидаем: продали в минус по last known, потом привезли по той же цене —
+		// средневзвешенная должна вернуться к исходной, а не поехать.
+		const stockBefore = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const { rows: costBefore } = await ctx.pool.query(
+			`select cost from products where company_id=$1 and id=$2`, [ctx.companyId, ctx.ids.product])
+		const priorCost = Number(costBefore[0].cost)
+
+		await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-close-negative',
+				type: 'receive',
+				warehouseId: ctx.ids.warehouse,
+				supplierId: ctx.ids.supplier,
+				items: [{ productId: ctx.ids.product, qty: Math.abs(stockBefore) + 30, cost: priorCost }],
+			},
+		})
+
+		const { rows: costAfter } = await ctx.pool.query(
+			`select cost from products where company_id=$1 and id=$2`, [ctx.companyId, ctx.ids.product])
+		expect(Number(costAfter[0].cost)).toBeCloseTo(priorCost, 4)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('перемещение сверх остатка отклоняется — товар физически на «Основном» отсутствует', async () => {
+		const have = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-transfer-too-big',
+				type: 'transfer',
+				warehouseId: ctx.ids.warehouse,
+				warehouseToId: ctx.ids.warehouse2,
+				items: [{ productId: ctx.ids.product, qty: have + 5000 }],
+			},
+		})
+		expect(res.statusCode).toBeGreaterThanOrEqual(400)
+		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+	})
+
+	it('списание сверх остатка отклоняется — списывать нечего', async () => {
+		const have = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-writeoff-too-big',
+				type: 'writeoff',
+				warehouseId: ctx.ids.warehouse,
+				items: [{ productId: ctx.ids.product, qty: have + 5000 }],
+				reason: 'бой',
+			},
+		})
+		expect(res.statusCode).toBeGreaterThanOrEqual(400)
+		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+	})
+
+	it('повтор запроса с тем же Idempotency-Key не задваивает проводку', async () => {
+		const key = randomUUID()
+		const body = {
+			document: {
+				id: 'doc-in-idem',
+				type: 'receive',
+				warehouseId: ctx.ids.warehouse,
+				supplierId: ctx.ids.supplier,
+				items: [{ productId: ctx.ids.product, qty: 5, cost: 30 }],
+			},
+		}
+		const before = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		await call(ctx, 'POST', '/v1/documents/post', body, key)
+		await call(ctx, 'POST', '/v1/documents/post', body, key)
+		const after = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+
+		expect(after - before).toBe(5)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('отмена заказа распроводит документ и возвращает товар', async () => {
+		await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-cancel', customerId: ctx.ids.customer, onCredit: true, discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 3, price: 50 }],
+			},
+		})
+		const afterSale = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+
+		const res = await call(ctx, 'POST', '/v1/orders/order-cancel/status', { status: 'cancelled' })
+		// Продажа через /v1/sales создаёт заказ сразу в статусе delivered, из
+		// которого переходов нет — отменить проведённую продажу невозможно.
+		expect(res.statusCode).toBeLessThan(300)
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(afterSale + 3)
+		expect(await drift(ctx)).toEqual([])
+	})
+})
