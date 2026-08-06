@@ -149,29 +149,40 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(await drift(ctx)).toEqual([])
 	})
 
-	it('перемещение сверх остатка отклоняется — товар физически на складе отсутствует', async () => {
-		// Transfer ещё не реализован в REST API (нет в DocumentBody enum),
-		// поэтому тестируем через прямой SQL — post_doc с doc_type='transfer'.
-		const have = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
-		const docId = 'doc-transfer-too-big'
-		await ctx.pool.query(
-			`insert into docs (company_id, id, doc_type, warehouse_id, warehouse_to_id)
-			 values ($1,$2,'transfer',$3,$4)`,
-			[ctx.companyId, docId, ctx.ids.warehouse, ctx.ids.warehouse2])
-		await ctx.pool.query(
-			`insert into doc_lines (company_id, id, doc_id, line_no, product_id, qty, price)
-			 values ($1,$2,$3,1,$4,$5,0)`,
-			[ctx.companyId, `${docId}-0`, docId, ctx.ids.product, have + 5000])
+	it('перемещение через API: товар уходит с одного склада и приходит на другой', async () => {
+		const before1 = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const before2 = await stockAt(ctx, ctx.ids.warehouse2, ctx.ids.product)
+		const qty = 10
 
-		try {
-			await ctx.pool.query('select post_doc($1,$2)', [ctx.companyId, docId])
-			expect.unreachable('should have thrown P0001')
-		} catch (err: any) {
-			expect(err.code).toBe('P0001')
-		}
-		// Cleanup: doc stays as draft, no movements created
-		await ctx.pool.query('delete from doc_lines where company_id=$1 and doc_id=$2', [ctx.companyId, docId])
-		await ctx.pool.query('delete from docs where company_id=$1 and id=$2', [ctx.companyId, docId])
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-transfer-ok',
+				type: 'transfer',
+				warehouseId: ctx.ids.warehouse,
+				warehouseToId: ctx.ids.warehouse2,
+				items: [{ productId: ctx.ids.product, qty }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(before1 - qty)
+		expect(await stockAt(ctx, ctx.ids.warehouse2, ctx.ids.product)).toBe(before2 + qty)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('перемещение сверх остатка отклоняется — товар физически на складе отсутствует', async () => {
+		const have = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const res = await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-transfer-too-big',
+				type: 'transfer',
+				warehouseId: ctx.ids.warehouse,
+				warehouseToId: ctx.ids.warehouse2,
+				items: [{ productId: ctx.ids.product, qty: have + 5000 }],
+			},
+		})
+		expect(res.statusCode).toBeGreaterThanOrEqual(400)
+		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
 	})
 
 	it('списание сверх остатка отклоняется — списывать нечего', async () => {

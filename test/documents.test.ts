@@ -91,6 +91,115 @@ describe('POST /v1/documents/post', () => {
 		expect(log.some(e => e.sql.startsWith('rollback'))).toBe(true)
 	})
 
+	it('transfer: создаёт transfer doc с warehouse_to_id + post_doc', async () => {
+		const core = coreHandler({ postDocTotal: 0 })
+		const { app, log } = await makeTestApp({
+			handler: (sql, params) => {
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				return undefined
+			},
+		})
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/documents/post',
+			headers: await authHeaders({ 'idempotency-key': 'doc-transfer-001' }),
+			payload: {
+				document: {
+					id: 'd-t1', type: 'transfer',
+					warehouseId: 'wh-main', warehouseToId: 'wh-shop',
+					items: [{ productId: 'p-1', qty: 5 }],
+				},
+			},
+		})
+		expect(res.statusCode).toBe(201)
+		const docsInsert = log.find(e => e.sql.includes('insert into docs'))!
+		expect(docsInsert.params).toContain('transfer')
+		expect(docsInsert.params).toContain('wh-main')
+		expect(docsInsert.params).toContain('wh-shop')
+		expect(log.some(e => e.sql.includes('post_doc'))).toBe(true)
+	})
+
+	it('transfer: без warehouseToId → 400 VALIDATION_ERROR', async () => {
+		const { app } = await makeTestApp({ handler: () => undefined })
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/documents/post',
+			headers: await authHeaders({ 'idempotency-key': 'doc-transfer-002' }),
+			payload: {
+				document: {
+					id: 'd-t2', type: 'transfer',
+					warehouseId: 'wh-main',
+					items: [{ productId: 'p-1', qty: 5 }],
+				},
+			},
+		})
+		expect(res.statusCode).toBe(400)
+		expect(res.json().error.code).toBe('VALIDATION_ERROR')
+	})
+
+	it('transfer: одинаковые склады → 400 VALIDATION_ERROR', async () => {
+		const { app } = await makeTestApp({ handler: () => undefined })
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/documents/post',
+			headers: await authHeaders({ 'idempotency-key': 'doc-transfer-003' }),
+			payload: {
+				document: {
+					id: 'd-t3', type: 'transfer',
+					warehouseId: 'wh-main', warehouseToId: 'wh-main',
+					items: [{ productId: 'p-1', qty: 5 }],
+				},
+			},
+		})
+		expect(res.statusCode).toBe(400)
+		expect(res.json().error.code).toBe('VALIDATION_ERROR')
+	})
+
+	it('transfer: без warehouseId → 400 VALIDATION_ERROR', async () => {
+		const { app } = await makeTestApp({ handler: () => undefined })
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/documents/post',
+			headers: await authHeaders({ 'idempotency-key': 'doc-transfer-004' }),
+			payload: {
+				document: {
+					id: 'd-t4', type: 'transfer',
+					warehouseToId: 'wh-shop',
+					items: [{ productId: 'p-1', qty: 5 }],
+				},
+			},
+		})
+		expect(res.statusCode).toBe(400)
+		expect(res.json().error.code).toBe('VALIDATION_ERROR')
+	})
+
+	it('transfer: нехватка остатка → post_doc бросает P0001 → 409', async () => {
+		const core = coreHandler({ throwOnPostDoc: { code: 'P0001', message: 'Недостаточно товара' } })
+		const { app, log } = await makeTestApp({
+			handler: (sql, params) => {
+				const c = core(sql, params)
+				if (c !== undefined) return c
+				return undefined
+			},
+		})
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/documents/post',
+			headers: await authHeaders({ 'idempotency-key': 'doc-transfer-005' }),
+			payload: {
+				document: {
+					id: 'd-t5', type: 'transfer',
+					warehouseId: 'wh-main', warehouseToId: 'wh-shop',
+					items: [{ productId: 'p-1', qty: 999 }],
+				},
+			},
+		})
+		expect(res.statusCode).toBe(409)
+		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+		expect(log.some(e => e.sql.startsWith('rollback'))).toBe(true)
+	})
+
 	it('adjust: инвентаризация создаёт inventory doc + post_doc', async () => {
 		const core = coreHandler({ postDocTotal: 0 })
 		const { app, log } = await makeTestApp({

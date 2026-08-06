@@ -25,11 +25,12 @@ const DocumentBody = z.object({
 	document: z.object({
 		id: id,
 		no: z.string().max(64).optional(),
-		type: z.enum(['receive', 'writeoff', 'adjust']),
+		type: z.enum(['receive', 'writeoff', 'adjust', 'transfer']),
 		items: z.array(DocItem).min(1).max(500),
 		reason: z.string().max(500).optional(),
 		note: z.string().max(2000).optional(),
 		warehouseId: id.optional(),
+		warehouseToId: id.optional(),
 		supplierId: id.optional(),
 	}),
 })
@@ -65,6 +66,7 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 			let docType: string
 			let partyKind: string | null = null
 			let partyId: string | null = null
+			let warehouseToId: string | null = null
 
 			if (doc.type === 'receive') {
 				if (doc.supplierId) {
@@ -76,6 +78,12 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 				}
 			} else if (doc.type === 'writeoff') {
 				docType = 'writeoff'
+			} else if (doc.type === 'transfer') {
+				docType = 'transfer'
+				if (!doc.warehouseId) throw Errors.validation([{ message: 'Перемещение: не указан склад-источник (warehouseId)' }])
+				if (!doc.warehouseToId) throw Errors.validation([{ message: 'Перемещение: не указан склад-приёмник (warehouseToId)' }])
+				if (doc.warehouseId === doc.warehouseToId) throw Errors.validation([{ message: 'Перемещение: склад-источник и склад-приёмник совпадают' }])
+				warehouseToId = doc.warehouseToId
 			} else {
 				docType = 'inventory'
 			}
@@ -91,9 +99,9 @@ export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 			}
 
 			await client.query(
-				`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id, note, reason, "by")
-				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-				[auth.companyId, doc.id, docType, warehouseId, partyKind, partyId, doc.note ?? null, doc.reason ?? null, actor],
+				`insert into docs (company_id, id, doc_type, warehouse_id, warehouse_to_id, party_kind, party_id, note, reason, "by")
+				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+				[auth.companyId, doc.id, docType, warehouseId, warehouseToId, partyKind, partyId, doc.note ?? null, doc.reason ?? null, actor],
 			)
 
 			const items = [...doc.items].sort((a, b) => a.productId.localeCompare(b.productId))
