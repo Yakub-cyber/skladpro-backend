@@ -166,7 +166,7 @@ describe('POST /v1/returns', () => {
 	it('полный возврат: создаёт sales_return + post_doc, returned=true', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
-				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [], items: soldItems },
+				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [], items: soldItems, customer_id: 'cu-1' },
 			),
 		})
 		const res = await app.inject({
@@ -179,7 +179,7 @@ describe('POST /v1/returns', () => {
 		expect(res.json().fullyReturned).toBe(true)
 
 		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
-		expect(docsInsert.sql).toContain('sales_return')
+		expect(docsInsert.params).toContain('sales_return')
 		expect(log.filter(e => e.sql.includes('insert into doc_lines')).length).toBe(2)
 		expect(log.some(e => e.sql.includes('post_doc'))).toBe(true)
 		expect(log.some(e => e.sql.includes('update orders set returns') && e.params[3] === true)).toBe(true)
@@ -262,12 +262,12 @@ describe('POST /v1/returns', () => {
 		})
 		expect(res.statusCode).toBe(201)
 		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
-		expect(docsInsert.sql).toContain('sales_return')
+		expect(docsInsert.params).toContain('sales_return')
 		expect(docsInsert.params).toContain('customer')
 		expect(docsInsert.params).toContain('cu-42')
 	})
 
-	it('возврат заказа НЕ on_credit — party=null', async () => {
+	it('возврат заказа с клиентом (не on_credit) — sales_return с party', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith(
 				{
@@ -285,9 +285,26 @@ describe('POST /v1/returns', () => {
 			payload: { orderId: 'o-1' },
 		})
 		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
-		expect(docsInsert.sql).toContain('sales_return')
-		// party_kind and party_id should be null for non-credit
-		expect(docsInsert.params).toContain(null)
+		expect(docsInsert.params).toContain('sales_return')
+		expect(docsInsert.params).toContain('customer')
+		expect(docsInsert.params).toContain('cu-42')
+	})
+
+	it('розничный возврат (без customer_id) создаёт retail_return', async () => {
+		const { app, log } = await makeTestApp({
+			handler: handlerWith(
+				{ id: 'o-1', no: '7', status: 'delivered', stock_consumed: true, returned: false, returns: [], items: soldItems },
+			),
+		})
+		const res = await app.inject({
+			method: 'POST',
+			url: '/v1/returns',
+			headers: await authHeaders({ 'idempotency-key': 'return-retail-01' }),
+			payload: { orderId: 'o-1' },
+		})
+		expect(res.statusCode).toBe(201)
+		const docsInsert = log.find(e => e.sql.includes('insert into docs') && !e.sql.includes('doc_lines'))!
+		expect(docsInsert.params).toContain('retail_return')
 	})
 
 	it('полный возврат вызывает post_doc, не ручное обновление stock', async () => {

@@ -121,6 +121,9 @@ begin
   if d.status = 'posted' then
     raise exception 'Документ % уже проведён', p_doc using errcode = 'P0003';
   end if;
+  if d.status = 'void' then
+    raise exception 'Документ % аннулирован, повторное проведение запрещено', p_doc using errcode = 'P0004';
+  end if;
 
   case d.doc_type
     when 'purchase_receipt'   then sign_stock :=  1; settle_sign := -1;

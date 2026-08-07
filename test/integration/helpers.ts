@@ -19,6 +19,7 @@ import { runMigrations } from '../../src/migrate.js'
  */
 
 export const hasDb = Boolean(process.env.TEST_DATABASE_URL)
+export const allowSkipIntegration = Boolean(process.env.ALLOW_SKIP_INTEGRATION)
 
 export function integrationConfig(): Config {
 	return {

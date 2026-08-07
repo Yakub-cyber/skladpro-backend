@@ -5,6 +5,12 @@ import type { DbPool } from '../db.js'
 import { Errors } from '../lib/errors.js'
 import { fromRequest, logSecurityEvent } from '../services/security-log.js'
 
+const EnsureMeBody = z.object({
+	id: z.string().min(1).max(64),
+	name: z.string().min(1).max(200),
+	role: z.enum(['admin', 'manager', 'stock', 'courier']).optional(),
+})
+
 const PinSetBody = z.object({
 	employeeId: z.string().min(1).max(64),
 	pin: z.string().regex(/^\d{4,8}$/, 'PIN — от 4 до 8 цифр'),
@@ -24,6 +30,53 @@ const PIN_RATE_LIMIT = { max: 10, timeWindow: '1 minute' as const }
  * (исключён из sync pull), открытых PIN в схеме нет вообще.
  */
 export function registerPinRoutes(app: FastifyInstance, pool: DbPool) {
+	// ── Ensure-me: привязка сотрудника к текущему user ────────────────────
+	// Bootstrap клиента вызывает этот эндпоинт вместо cloudUpsert, чтобы
+	// user_id ставился сервером (привилегированное поле, не в push whitelist).
+	// Upsert по (company_id, user_id) — повторный вызов обновляет имя/роль,
+	// а не создаёт дубликат.
+	app.post('/v1/employees/me', { preHandler: app.authenticate }, async (request, reply) => {
+		const auth = request.auth
+		const parsed = EnsureMeBody.safeParse(request.body)
+		if (!parsed.success) throw Errors.validation(parsed.error.issues)
+		const { id, name, role } = parsed.data
+		const effectiveRole = role ?? auth.role ?? 'admin'
+
+		// Если user уже привязан к сотруднику (после предыдущего bootstrap) —
+		// обновляем имя и возвращаем. Не создаём второго.
+		const existing = await pool.query(
+			`select id, name, role, user_id from employees
+			 where company_id = $1 and user_id = $2 and deleted_at is null
+			 limit 1`,
+			[auth.companyId, auth.userId],
+		)
+		if (existing.rows.length > 0) {
+			const emp = existing.rows[0]
+			if (emp.name !== name) {
+				await pool.query(
+					`update employees set name = $3 where company_id = $1 and id = $2`,
+					[auth.companyId, emp.id, name],
+				)
+				emp.name = name
+			}
+			reply.code(200)
+			return { ok: true, employee: emp }
+		}
+
+		const { rows } = await pool.query(
+			`insert into employees (company_id, id, name, role, user_id, active)
+			 values ($1, $2, $3, $4, $5, true)
+			 on conflict (company_id, id) do update
+			   set user_id = excluded.user_id,
+			       name = excluded.name,
+			       deleted_at = null
+			 returning id, name, role, user_id`,
+			[auth.companyId, id, name, effectiveRole, auth.userId],
+		)
+		reply.code(200)
+		return { ok: true, employee: rows[0] }
+	})
+
 	app.post(
 		'/v1/employees/pin/set',
 		{ preHandler: app.authenticate, config: { rateLimit: PIN_RATE_LIMIT } },

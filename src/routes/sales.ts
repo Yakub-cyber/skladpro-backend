@@ -129,13 +129,15 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 			)
 
 			for (const [i, item] of items.entries()) {
+				const factor = item.unitFactor ?? 1
+				const qtyBase = round4(item.qty * factor)
 				await client.query(
 					`insert into doc_lines (company_id, id, doc_id, line_no, product_id, unit_id, unit_factor,
 					                        qty_input, qty, price)
 					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 					[
 						auth.companyId, `${docId}-${i}`, docId, i, item.productId,
-						null, 1, item.qty, item.qty, item.price,
+						item.unitId ?? null, factor, item.qty, qtyBase, item.price,
 					],
 				)
 			}

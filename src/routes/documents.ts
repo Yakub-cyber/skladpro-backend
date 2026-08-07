@@ -15,9 +15,12 @@ const id = z.string().min(1).max(64)
 const DocItem = z.object({
 	productId: id,
 	name: z.string().max(300).optional(),
+	// qty — количество в единицах ввода. qtyBase = qty * unitFactor записывается в doc_lines.qty.
 	qty: z.number().finite().min(0).max(1_000_000),
+	// cost — себестоимость за единицу ввода. Сервер НЕ пересчитывает при unitFactor.
 	cost: z.number().finite().min(0).optional(),
 	unitId: id.optional(),
+	// unitFactor — коэффициент упаковки (default 1). Передавать только когда пользователь явно выбрал единицу.
 	unitFactor: z.number().finite().positive().optional(),
 })
 

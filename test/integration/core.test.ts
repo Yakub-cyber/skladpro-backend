@@ -1,11 +1,14 @@
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { call, cash, costAt, debt, drift, hasDb, setupIntegration, stockAt, type Ctx } from './helpers.js'
+import { call, cash, costAt, debt, drift, hasDb, allowSkipIntegration, setupIntegration, stockAt, type Ctx } from './helpers.js'
 
-/**
- * Сквозной тест учётного ядра на живой базе.
- * Проверяет ЦИФРЫ после операций, а не текст SQL-запросов.
- */
+if (!hasDb && !allowSkipIntegration) {
+	throw new Error(
+		'TEST_DATABASE_URL не задан. Интеграционные тесты требуют живую базу.\n' +
+		'Задайте TEST_DATABASE_URL или ALLOW_SKIP_INTEGRATION=1 для явного пропуска.',
+	)
+}
+
 describe.skipIf(!hasDb)('учётное ядро на живой базе', () => {
 	let ctx: Ctx
 
@@ -303,6 +306,106 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(res.statusCode).toBeLessThan(300)
 
 		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(afterSale + 3)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('продажа в упаковках: qty пересчитывается по unitFactor', async () => {
+		const before = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+
+		const res = await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-pack-sale', customerId: ctx.ids.customer, onCredit: true, discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 2, price: 600, unitFactor: 12 }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+
+		// 2 упаковки по 12 = 24 штуки списано
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(before - 24)
+		// сумма: 2 × 600 = 1200 (цена за упаковку, не за штуку)
+		expect(res.json().order.total).toBe(1200)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('отмена продажи в упаковках: stock возвращается ровно на 24', async () => {
+		const before = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+
+		const res = await call(ctx, 'POST', '/v1/orders/order-pack-sale/status', { status: 'cancelled' })
+		expect(res.statusCode).toBeLessThan(300)
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(before + 24)
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('розничная продажа (без контрагента) → retail_receipt + деньги в кассу', async () => {
+		await call(ctx, 'POST', '/v1/documents/post', {
+			document: {
+				id: 'doc-in-for-retail',
+				type: 'receive',
+				warehouseId: ctx.ids.warehouse,
+				supplierId: ctx.ids.supplier,
+				items: [{ productId: ctx.ids.product, qty: 50, cost: 30 }],
+			},
+		})
+		const stockBefore = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const cashBefore = await cash(ctx, ctx.ids.account)
+
+		const res = await call(ctx, 'POST', '/v1/sales', {
+			order: {
+				id: 'order-retail',
+				onCredit: false,
+				discount: 0,
+				items: [{ productId: ctx.ids.product, qty: 10, price: 50 }],
+			},
+		})
+		expect(res.statusCode).toBe(201)
+
+		const { rows } = await ctx.pool.query(
+			`select doc_type, party_kind, party_id from docs
+			  where company_id=$1 and order_id='order-retail' and status='posted'`,
+			[ctx.companyId])
+		expect(rows[0]?.doc_type).toBe('retail_receipt')
+		expect(rows[0]?.party_id).toBeNull()
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(stockBefore - 10)
+		expect(await cash(ctx, ctx.ids.account)).toBe(cashBefore + 500)
+
+		const { rows: sms } = await ctx.pool.query(
+			`select count(*) c from settlement_movements
+			  where company_id=$1 and doc_id in (select id from docs where company_id=$1 and order_id='order-retail')`,
+			[ctx.companyId])
+		expect(Number(sms[0].c)).toBe(0)
+
+		expect(await drift(ctx)).toEqual([])
+	})
+
+	it('розничный возврат → retail_return, деньги уходят из кассы', async () => {
+		const stockBefore = await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)
+		const cashBefore = await cash(ctx, ctx.ids.account)
+
+		const res = await call(ctx, 'POST', '/v1/returns', {
+			orderId: 'order-retail',
+			items: [{ productId: ctx.ids.product, qty: 3 }],
+			reason: 'брак',
+		})
+		expect(res.statusCode).toBeLessThan(300)
+
+		const { rows } = await ctx.pool.query(
+			`select doc_type, party_kind, party_id from docs
+			  where company_id=$1 and doc_type='retail_return' and status='posted'`,
+			[ctx.companyId])
+		expect(rows).toHaveLength(1)
+		expect(rows[0]?.party_id).toBeNull()
+
+		expect(await stockAt(ctx, ctx.ids.warehouse, ctx.ids.product)).toBe(stockBefore + 3)
+		expect(await cash(ctx, ctx.ids.account)).toBe(cashBefore - 150)
+
+		const { rows: sms } = await ctx.pool.query(
+			`select count(*) c from settlement_movements
+			  where company_id=$1 and doc_id in (select id from docs where company_id=$1 and doc_type='retail_return')`,
+			[ctx.companyId])
+		expect(Number(sms[0].c)).toBe(0)
+
 		expect(await drift(ctx)).toEqual([])
 	})
 

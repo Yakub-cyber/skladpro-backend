@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: skladpro_dev
+          POSTGRES_PASSWORD: skladpro_dev_pass
+          POSTGRES_DB: skladpro_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U skladpro_dev -d skladpro_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://skladpro_dev:skladpro_dev_pass@localhost:5432/skladpro_test
+      TEST_DATABASE_URL: postgresql://skladpro_dev:skladpro_dev_pass@localhost:5432/skladpro_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run all tests (unit + integration)
+        run: npx vitest run

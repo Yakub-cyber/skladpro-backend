@@ -136,17 +136,31 @@ export function registerReturnRoutes(app: FastifyInstance, pool: DbPool) {
 			)
 			const warehouseId = whs[0]?.id ?? null
 
-			const isCredit = order.on_credit && order.customer_id && order.customer_id !== 'retail'
+			const isRetail = !order.customer_id || order.customer_id === 'retail'
+			const hasParty = !isRetail
+			const docType = isRetail ? 'retail_return' : 'sales_return'
 			const docId = `ret-${orderId}-${Date.now()}`
+
+			// retail_return: деньги из кассы, без взаиморасчётов.
+			// sales_return: уменьшает долг клиента через settlement.
+			let accountId: string | null = null
+			if (isRetail) {
+				const { rows: accs } = await client.query(
+					`select id from money_accounts where company_id = $1 and deleted_at is null order by is_default desc, id limit 1`,
+					[auth.companyId],
+				)
+				accountId = accs[0]?.id ?? null
+			}
 
 			await client.query(
 				`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id,
-				                   order_id, reason, "by")
-				 values ($1,$2,'sales_return',$3,$4,$5,$6,$7,$8)`,
+				                   account_id, order_id, reason, "by")
+				 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 				[
-					auth.companyId, docId, warehouseId,
-					isCredit ? 'customer' : null,
-					isCredit ? order.customer_id : null,
+					auth.companyId, docId, docType, warehouseId,
+					hasParty ? 'customer' : null,
+					hasParty ? order.customer_id : null,
+					accountId,
 					orderId,
 					reason ?? null,
 					actor,

@@ -190,6 +190,16 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 					}
 				}
 
+				// unpost_doc ставит status='draft', но для отмены нужен 'void':
+				// draft = «можно провести», void = «аннулирован, повторное проведение запрещено».
+				if (docRows.length > 0) {
+					await client.query(
+						`update docs set status = 'void'
+						 where company_id = $1 and order_id = $2 and status = 'draft'`,
+						[auth.companyId, orderId],
+					)
+				}
+
 				await client.query(`update orders set stock_consumed = false where company_id = $1 and id = $2`, [
 					auth.companyId,
 					orderId,
