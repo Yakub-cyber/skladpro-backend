@@ -1,9 +1,12 @@
+import { requirePermission } from '../lib/permissions.js'
+import { lockCustomerFinances } from '../services/customerFinance.js'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
-import { Errors, mapPgError } from '../lib/errors.js'
+import { ApiError, Errors, mapPgError } from '../lib/errors.js'
+import { returnV2 } from '../services/returnsV2.js'
 import { publishEvent } from '../services/events.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
 import { IdempotencyKey } from '../schemas/sale.js'
@@ -29,23 +32,46 @@ type ReturnEvent = { at: string; by: string; items: Array<{ productId: string; q
 export function registerReturnRoutes(app: FastifyInstance, pool: DbPool) {
 	app.post('/v1/returns', { preHandler: app.authenticate }, async (request, reply) => {
 		const auth = request.auth
-		if (auth.role === 'courier') throw Errors.forbidden()
+		requirePermission(auth.role, 'return')
 
 		const keyParsed = IdempotencyKey.safeParse(request.headers['idempotency-key'])
 		if (!keyParsed.success) throw Errors.validation(keyParsed.error.issues)
 		const idemKey = keyParsed.data
+		const version = (request.body as { contractVersion?: unknown } | null)?.contractVersion
+		if (version === 2) {
+			const result = await returnV2(pool, auth, request.body, idemKey).catch(error => {
+				if (error?.code === 'P0010' || error?.code === 'P0011') throw mapPgError(error, request.log)
+				throw error
+			})
+			if (result.replayed) reply.header('idempotency-replayed', 'true')
+			else publishEvent(pool, { companyId: auth.companyId, type: 'return', id: result.body.orderId, senderUserId: auth.userId })
+			return reply.code(result.status).send(result.body)
+		}
+		if (version !== undefined && version !== 1) throw Errors.validation([{ message: 'Неизвестная версия контракта возврата' }])
 
 		const parsed = ReturnBody.safeParse(request.body)
 		if (!parsed.success) throw Errors.validation(parsed.error.issues)
 		const { orderId, items: requestedItems, reason } = parsed.data
 
 		const result = await withTransaction(pool, async client => {
+			// A v1 request must not reuse a permanent v2 identity after temporary-key cleanup.
+			if (idemKey.startsWith('return:')) {
+				const permanent = await client.query(
+					`select id from docs where company_id=$1 and id=$2`,
+					[auth.companyId, `ret-${idemKey.slice(7)}`],
+				)
+				if (permanent.rows.length) throw new ApiError(409, 'RETURN_ID_CONFLICT', 'Ключ относится к возврату v2')
+			}
 			const claim = await claimIdempotencyKey(client, {
 				key: idemKey,
 				companyId: auth.companyId,
 				endpoint: 'POST /v1/returns',
 			})
-			if (claim.replay) return { status: claim.status, body: claim.response, replayed: true }
+			if (claim.replay) {
+				if ((claim.response as { contractVersion?: number })?.contractVersion === 2)
+					throw new ApiError(409, 'RETURN_ID_CONFLICT', 'Ключ относится к возврату v2')
+				return { status: claim.status, body: claim.response, replayed: true }
+			}
 
 			const { rows } = await client.query(
 				`select id, no, status, stock_consumed, returned, returns, items,
@@ -57,9 +83,14 @@ export function registerReturnRoutes(app: FastifyInstance, pool: DbPool) {
 			)
 			const order = rows[0]
 			if (!order) throw Errors.notFound(`Заказ ${orderId}`)
+			if (order.status === 'cancelled') throw Errors.saleNotPosted()
+			if (Array.isArray(order.returns) && order.returns.some((event: { contractVersion?: number }) => event.contractVersion === 2))
+				throw new ApiError(409, 'RETURN_V2_REQUIRED', 'По заказу уже есть возвраты v2; используйте contractVersion: 2')
 			if (!order.stock_consumed)
 				throw Errors.validation([{ message: 'По заказу не было отгрузки — возвращать нечего' }])
 			if (order.returned) throw Errors.validation([{ message: 'Заказ уже полностью возвращён' }])
+
+			await lockCustomerFinances(client, auth.companyId, [order.customer_id === 'retail' ? null : order.customer_id])
 
 			const sold = new Map<string, { qty: number; name?: string; cost?: number; price?: number }>()
 			for (const it of (order.items ?? []) as OrderItem[]) {

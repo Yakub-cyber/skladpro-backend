@@ -28,6 +28,8 @@ export const Errors = {
 	idempotencyMismatch: (was: string, now: string) =>
 		new ApiError(409, 'IDEMPOTENCY_MISMATCH', 'Этот Idempotency-Key уже использован для другой операции', { was, now }),
 	pinInvalid: () => new ApiError(401, 'PIN_INVALID', 'Неверный PIN'),
+	saleHasPostedReturns: () => new ApiError(409, 'SALE_HAS_POSTED_RETURNS', 'Продажа имеет проведённые возвраты; отмена запрещена'),
+	saleNotPosted: () => new ApiError(409, 'SALE_NOT_POSTED', 'Исходная продажа отменена или не проведена; возврат запрещён'),
 	// Лимит текущего тарифа исчерпан (B2). 402 Payment Required — семантически
 	// точный код: клиент должен апгрейднуть подписку.
 	subscriptionLimit: (feature: string, limit: number, current: number, plan: string) =>
@@ -46,6 +48,10 @@ const PG_ERROR_MAP: Record<string, (msg: string) => ApiError> = {
 	P0007: (msg) => new ApiError(400, 'MISSING_ACCOUNT', msg),
 	P0008: (msg) => new ApiError(409, 'DOC_NOT_POSTED', msg),
 	P0009: (msg) => new ApiError(500, 'LEDGER_GUARD', msg),
+	P0010: (msg) => new ApiError(409, 'SALE_HAS_POSTED_RETURNS', msg),
+	P0011: (msg) => new ApiError(409, 'SALE_NOT_POSTED', msg),
+	P0012: (msg) => new ApiError(409, 'DELIVERED_ORDER_CANCELLATION_FORBIDDEN', msg),
+	P0013: (msg) => new ApiError(409, 'DELIVERED_SHIPMENT_RECONCILIATION_REQUIRED', msg),
 }
 
 export function mapPgError(err: unknown, log?: { error: (obj: object, msg: string) => void }): Error {

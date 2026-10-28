@@ -1,3 +1,4 @@
+import { saleFingerprint } from '../../src/services/salesV2.js'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { buildApp } from '../../src/app.js'
@@ -221,4 +222,13 @@ export async function drift(ctx: Ctx): Promise<string[]> {
 	for (const r of dbl) problems.push(`двойная отгрузка по заказу ${r.order_id}: ${r.c} документа`)
 
 	return problems
+}
+
+/** Protected cancellation uses the exact original shipment body, including in races
+ * where its posting transaction has not committed yet. Test helper only. */
+export function cancelShipmentV2(ctx: Ctx, orderId: string, shipment: {shipmentId: string} & Record<string, unknown>) {
+  return call(ctx, 'POST', `/v1/orders/${orderId}/status`, {
+    contractVersion: 2, status: 'cancelled', shipmentId: shipment.shipmentId,
+    shipmentFingerprint: saleFingerprint({companyId: ctx.companyId, orderId, ...shipment}),
+  }, `cancelled:${shipment.shipmentId}`)
 }

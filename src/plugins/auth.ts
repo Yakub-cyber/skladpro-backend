@@ -1,3 +1,4 @@
+import { requireKnownRole } from '../lib/permissions.js'
 import { createHash } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import type { DbPool } from '../db.js'
@@ -37,16 +38,13 @@ declare module 'fastify' {
 }
 
 type MembershipRow = { company_id: string; role: string; name: string | null }
-type CacheEntry = { memberships: MembershipRow[]; expiresAt: number }
-const MEMBERSHIP_TTL_MS = 60_000
 
 /**
  * Аутентификация: Bearer access-JWT (наша подпись) → пользователь;
  * компания — из заголовка X-Company-Id (или единственная/первая активная).
- * Membership кэшируется на 60 секунд.
+ * Membership читается из БД для каждого запроса.
  */
 export function registerAuth(app: FastifyInstance, pool: DbPool, tokens: TokenService) {
-	const cache = new Map<string, CacheEntry>()
 
 	async function verifyBearer(request: FastifyRequest): Promise<{ userId: string; email: string | null }> {
 		const header = request.headers.authorization
@@ -61,10 +59,10 @@ export function registerAuth(app: FastifyInstance, pool: DbPool, tokens: TokenSe
 	}
 
 	async function loadMemberships(userId: string): Promise<MembershipRow[]> {
-		const cached = cache.get(userId)
-		if (cached && cached.expiresAt > Date.now()) return cached.memberships
+		// Security decisions must observe revocation/role changes across API workers.
+		// Do not authorize using the process-local membership cache.
 		// join users: деактивация пользователя (users.active=false) немедленно
-		// закрывает доступ (не позже TTL кэша — 60 сек).
+		// закрывает доступ для следующего запроса.
 		const { rows } = await pool.query(
 			`select m.company_id, m.role, m.name from memberships m
 			 join users u on u.id = m.user_id
@@ -72,7 +70,6 @@ export function registerAuth(app: FastifyInstance, pool: DbPool, tokens: TokenSe
 			 order by m.created_at asc`,
 			[userId],
 		)
-		cache.set(userId, { memberships: rows, expiresAt: Date.now() + MEMBERSHIP_TTL_MS })
 		return rows
 	}
 
@@ -107,6 +104,7 @@ export function registerAuth(app: FastifyInstance, pool: DbPool, tokens: TokenSe
 			member = memberships[0]
 		}
 
+        requireKnownRole(member!.role)
 		request.auth = {
 			userId,
 			email,
@@ -118,7 +116,7 @@ export function registerAuth(app: FastifyInstance, pool: DbPool, tokens: TokenSe
 	})
 
 	// Сброс кэша после операций, меняющих членство (accept invitation и т.п.)
-	app.decorate('invalidateMembershipCache', (userId: string) => cache.delete(userId))
+	app.decorate('invalidateMembershipCache', (_userId: string) => undefined)
 
 	// ── B4: X-API-Key ────────────────────────────────────────────────────
 	// Формат: sk_live_<8char prefix>_<32char secret>.

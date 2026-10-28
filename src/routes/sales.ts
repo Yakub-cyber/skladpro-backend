@@ -1,3 +1,6 @@
+import { postSaleV3 } from '../services/salesV3.js'
+import { requirePermission } from '../lib/permissions.js'
+import { lockCustomerFinances } from '../services/customerFinance.js'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import type { DbPool } from '../db.js'
@@ -6,7 +9,9 @@ import { ApiError, Errors, mapPgError } from '../lib/errors.js'
 import { publishEvent } from '../services/events.js'
 import { round4 } from '../lib/utils.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
-import { IdempotencyKey, SaleBody } from '../schemas/sale.js'
+import { IdempotencyKey, SaleBody, SaleV2Body } from '../schemas/sale.js'
+import { canonicalSale, saleConflict, saleFingerprint, saleV2Proof } from '../services/salesV2.js'
+import { lockCommercialOrder, commercialError } from '../services/orderCommercial.js'
 
 /**
  * POST /v1/sales — продажа (POS или веб).
@@ -16,23 +21,73 @@ import { IdempotencyKey, SaleBody } from '../schemas/sale.js'
 export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 	app.post('/v1/sales', { preHandler: app.authenticate }, async (request, reply) => {
 		const auth = request.auth
-		if (auth.role === 'courier') throw Errors.forbidden('Курьеру продажи недоступны')
+		requirePermission(auth.role, 'sale')
+  const version = (request.body as { contractVersion?: unknown } | null)?.contractVersion
+  if (version === 3) {
+   const result = await postSaleV3(pool, auth, request.body, request.headers['idempotency-key'])
+   reply.code(result.status)
+   if (result.replayed) reply.header('idempotency-replayed', 'true')
+   else publishEvent(pool, { companyId: auth.companyId, type: 'sale', id: result.body.orderId, senderUserId: auth.userId })
+   return result.body
+  }
+  if (version !== undefined && version !== 1 && version !== 2)
+   throw new ApiError(422, 'SALE_VERSION_UNSUPPORTED', 'Неизвестная версия продажи')
+
 
 		const keyParsed = IdempotencyKey.safeParse(request.headers['idempotency-key'])
 		if (!keyParsed.success) throw Errors.validation(keyParsed.error.issues)
 		const idemKey = keyParsed.data
 
-		const bodyParsed = SaleBody.safeParse(request.body)
+		const v2 = (request.body as { contractVersion?: unknown } | null)?.contractVersion === 2
+		const bodyParsed = (v2 ? SaleV2Body : SaleBody).safeParse(request.body)
 		if (!bodyParsed.success) throw Errors.validation(bodyParsed.error.issues)
 		const { order } = bodyParsed.data
+		const warehouse = v2 && 'warehouseId' in order && typeof order.warehouseId === 'string' ? order.warehouseId : null
+		const permanentRequest = v2 ? { contractVersion: 2, companyId: auth.companyId, order } : null
+		const fingerprint = v2 ? saleFingerprint(permanentRequest) : null
 
 		const result = await withTransaction(pool, async client => {
+   await lockCommercialOrder(client,auth.companyId,order.id)
+   if (!v2) {
+    const saved = (await client.query('select source_payload from docs where company_id=$1 and id=$2', [auth.companyId, `sale-${order.id}`])).rows[0]
+    let kind: unknown
+    try { kind = JSON.parse(saved?.source_payload ?? 'null')?.kind }
+    catch { if (saved?.source_payload?.includes('sale-v3')) saleConflict() }
+    if (kind === 'sale-v3') saleConflict()
+   }
+
+			if (v2) {
+				// Transaction-scoped, tenant-specific; works even before an order exists.
+				await client.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [JSON.stringify(['sale-v2', auth.companyId, order.id])])
+			}
 			const claim = await claimIdempotencyKey(client, {
 				key: idemKey,
 				companyId: auth.companyId,
 				endpoint: 'POST /v1/sales',
 			})
-			if (claim.replay) return { status: claim.status, body: claim.response, replayed: true }
+			if (v2) {
+				const proof = await saleV2Proof(client, auth.companyId, order.id, fingerprint!)
+				if (claim.replay && (!proof || canonicalSale(claim.response) !== canonicalSale(proof))) saleConflict()
+				if (proof) {
+					if (!claim.replay) await storeIdempotentResponse(client, auth.companyId, idemKey, 201, proof)
+					return { status: 201, body: proof, replayed: true }
+				}
+				// Do not turn an existing historical shipment into a second sale.
+				// Match the order-before-document lock order used by posting routes.
+				const existingOrder = await client.query('select stock_consumed, shipment_doc_id from orders where company_id=$1 and id=$2 for update', [auth.companyId, order.id])
+				if (existingOrder.rows[0]?.stock_consumed || existingOrder.rows[0]?.shipment_doc_id) saleConflict()
+				const historical = await client.query(`select id from docs where company_id=$1 and order_id=$2 and doc_type in ('retail_receipt','sales_shipment') limit 1`, [auth.companyId, order.id])
+				if (historical.rows.length) saleConflict()
+			} else if (claim.replay) {
+    if ((claim.response as {contractVersion?: unknown} | null)?.contractVersion === 3) saleConflict()
+    return { status: claim.status, body: claim.response, replayed: true }
+   }
+
+   const protectedOrder = await client.query('select commercial_snapshot from orders where company_id=$1 and id=$2 for update',[auth.companyId,order.id])
+   if (protectedOrder.rows[0]?.commercial_snapshot)
+    commercialError('ORDER_COMMERCIAL_PROTECTED','Продажа не может перезаписать защищённый коммерческий заказ')
+
+			await lockCustomerFinances(client, auth.companyId, [order.customerId === 'retail' ? null : order.customerId])
 
 			const items = order.items
 				.map(it => ({ ...it, qty: round4(it.qty) }))
@@ -91,11 +146,13 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 			const total = round2(subtotal - discount)
 			if (total < -0.000001) throw Errors.validation([{ message: 'Скидка больше суммы чека' }])
 
-			// Склад по умолчанию
-			const { rows: whs } = await client.query(
-				`select id from warehouses where company_id = $1 and deleted_at is null order by id limit 1`,
-				[auth.companyId],
-			)
+			// V2 fixes the explicit warehouse; legacy retains default selection.
+			const { rows: whs } = v2 ? await client.query(
+				`select id from warehouses where company_id=$1 and id=$2 and deleted_at is null for share`,
+				[auth.companyId, warehouse],
+			) : await client.query(
+				`select id from warehouses where company_id = $1 and deleted_at is null order by id limit 1`, [auth.companyId])
+			if (v2 && !whs.length) throw new ApiError(422, 'SALE_WAREHOUSE_UNAVAILABLE', 'Склад недоступен для новой продажи')
 			const warehouseId = whs[0]?.id ?? null
 
 			// Счёт денег по умолчанию (для retail_receipt)
@@ -246,7 +303,12 @@ export function registerSalesRoutes(app: FastifyInstance, pool: DbPool) {
 				[auth.companyId, randomUUID(), actor, `Продажа №${order.no ?? order.id} на ${total}`],
 			)
 
-			const body = { ok: true, order: { id: order.id, no: order.no ?? null, subtotal, discount, total } }
+			const body = { ok: true, order: { id: order.id, no: order.no ?? null, subtotal, discount, total },
+				...(v2 ? { contractVersion: 2, documentId: docId, warehouseId, fingerprint,
+					items: items.map((item, i) => ({ saleLineId: `${docId}-${i}`, productId: item.productId,
+						qtyBase: round4(item.qty * (item.unitFactor ?? 1)).toFixed(4) })) } : {}) }
+			if (v2) await client.query('update docs set source_payload=$3 where company_id=$1 and id=$2',
+				[auth.companyId, docId, JSON.stringify({ kind: 'sale-v2', request: permanentRequest, fingerprint, result: body })])
 			await storeIdempotentResponse(client, auth.companyId, idemKey, 201, body)
 			return { status: 201, body, replayed: false }
 		})

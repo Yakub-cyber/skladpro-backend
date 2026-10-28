@@ -1,6 +1,9 @@
+import { canSyncTable, requirePermission } from '../lib/permissions.js'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
+import { withTransaction } from '../db.js'
+import { lockCommercialOrder } from '../services/orderCommercial.js'
 import { ApiError, Errors } from '../lib/errors.js'
 import { checkLimit, type LimitFeature } from '../services/subscription.js'
 
@@ -64,7 +67,7 @@ const COURIER_EXTRA_EXCLUDE: Record<string, string[]> = {
 	products: ['cost', 'batches', 'min_stock', 'prices'],
 	movements: ['cost'],
 	customers: ['balance', 'bonus', 'total_spent'],
-	orders: ['discount', 'subtotal'],
+	orders: ['discount', 'subtotal', 'commercial_snapshot'],
 	stock_balances: ['cost_amount'],
 	doc_lines: ['price', 'cost_amount'],
 }
@@ -152,7 +155,18 @@ export function registerSyncRoutes(app: FastifyInstance, pool: DbPool) {
 		const results: Array<{ ok: boolean; error?: string; code?: string }> = []
 		for (const op of parsed.data.ops) {
 			try {
-				results.push(await applyOp(pool, auth, op))
+    if (!canSyncTable(auth.role,op.table)) { results.push({ok:false,code:'FORBIDDEN',error:'Недостаточно прав для таблицы'}); continue }
+    if (op.table === 'orders') {
+     results.push(await withTransaction(pool, async client => {
+      if (typeof op.row.id !== 'string' || !ID_RE.test(op.row.id)) return {ok:false,code:'BAD_ID',error:'Некорректный id'}
+      await lockCommercialOrder(client,auth.companyId,op.row.id)
+      const existing = await client.query('select commercial_snapshot, stock_consumed, shipment_doc_id from orders where company_id=$1 and id=$2 for update',[auth.companyId,op.row.id])
+      if (existing.rows[0]?.commercial_snapshot) return {ok:false,code:'ORDER_COMMERCIAL_PROTECTED',error:'Заказ изменяется только через commercial v2'}
+      if (existing.rows[0]?.stock_consumed || existing.rows[0]?.shipment_doc_id) return {ok:false,code:'HAS_STOCK_MOVEMENT',error:'Отгруженный заказ защищён'}
+      const db: DbPool = { query: client.query.bind(client),connect:pool.connect.bind(pool),end:pool.end.bind(pool) }
+      return applyOp(db,auth,op)
+     }))
+    } else results.push(await applyOp(pool, auth, op))
 			} catch (err) {
 				const pgCode = err && typeof err === 'object' && 'code' in err ? (err as any).code : undefined
 				if (pgCode && typeof pgCode === 'string') {
@@ -180,7 +194,7 @@ export function registerSyncRoutes(app: FastifyInstance, pool: DbPool) {
 
 	app.put('/v1/settings', { preHandler: app.authenticate }, async request => {
 		const auth = request.auth
-		if (auth.role === 'courier') throw Errors.forbidden()
+		requirePermission(auth.role, 'settings')
 		const body = z.object({ data: z.record(z.unknown()) }).safeParse(request.body)
 		if (!body.success) throw Errors.validation(body.error.issues)
 		await pool.query(

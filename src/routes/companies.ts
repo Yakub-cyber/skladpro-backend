@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
+import { AcceptInvitationBody, acceptInvitation, invitationHash } from '../services/invitations.js'
+import { requirePermission } from '../lib/permissions.js'
 import { Errors } from '../lib/errors.js'
 
 const CreateCompanyBody = z.object({
@@ -73,21 +75,20 @@ export function registerCompanyRoutes(app: FastifyInstance, pool: DbPool) {
 
 	app.post('/v1/invitations', { preHandler: app.authenticate }, async (request, reply) => {
 		const auth = request.auth
-		if (!['admin', 'manager'].includes(auth.role)) throw Errors.forbidden('Приглашает только админ или менеджер')
+		requirePermission(auth.role, 'invite')
 
 		const parsed = InviteBody.safeParse(request.body)
 		if (!parsed.success) throw Errors.validation(parsed.error.issues)
 		const { email, role, name } = parsed.data
+		if (role === 'admin') requirePermission(auth.role, 'manageRoles')
 
-		// B5-2: генерим одноразовый token для инвайт-ссылки. Раньше accept
-		// работал по email-match, теперь дополнительно принимаем ссылку с
-		// token'ом — регистрация с ним делает авто-accept без второго шага.
+		// Return the bearer secret only once; persist its SHA-256 digest.
 		const token = randomBytes(24).toString('base64url')
 		const { rows } = await pool.query(
-			`insert into invitations (company_id, email, role, name, created_by, token)
-			 values ($1, $2, $3, $4, $5, $6)
+			`insert into invitations (company_id, email, role, name, created_by, secret_hash, expires_at)
+			 values ($1, $2, $3, $4, $5, $6, now() + interval '7 days')
 			 returning id`,
-			[auth.companyId, email, role, name ?? null, auth.userId, token],
+			[auth.companyId, email, role, name ?? null, auth.userId, invitationHash(token)],
 		)
 		reply.code(201)
 		return { ok: true, id: rows[0].id, token }
@@ -95,35 +96,11 @@ export function registerCompanyRoutes(app: FastifyInstance, pool: DbPool) {
 
 	// Пользователь уже зарегистрирован и получил приглашение позже.
 	app.post('/v1/invitations/accept', { preHandler: app.authenticateUser }, async request => {
-		const userId = request.auth.userId
-		const email = request.auth.email
-		if (!email) throw Errors.forbidden('У пользователя нет email')
-
-		const companyId = await withTransaction(pool, async client => {
-			const { rows } = await client.query(
-				`select id, company_id, role, name from invitations
-				 where lower(email) = lower($1)
-				 order by created_at desc limit 1
-				 for update`,
-				[email],
-			)
-			const inv = rows[0]
-			if (!inv) throw Errors.notFound('Приглашение')
-			await client.query(
-				`insert into memberships (user_id, company_id, role, name)
-				 values ($1, $2, $3, $4)
-				 on conflict (user_id, company_id) do nothing`,
-				[userId, inv.company_id, inv.role, inv.name ?? null],
-			)
-			await client.query(`delete from invitations where company_id = $1 and lower(email) = lower($2)`, [
-				inv.company_id,
-				email,
-			])
-			return inv.company_id
-		})
-
-		app.invalidateMembershipCache(userId)
-		return { ok: true, companyId }
+        const parsed = AcceptInvitationBody.safeParse(request.body)
+        if (!parsed.success) throw Errors.validation([{message:'Требуется секрет приглашения'}])
+        const result = await withTransaction(pool, client => acceptInvitation(client,request.auth.userId,parsed.data.token))
+        app.invalidateMembershipCache(request.auth.userId)
+        return result
 	})
 
 	// ── Админ-панель: приглашения ──────────────────────────────────────────
@@ -132,13 +109,13 @@ export function registerCompanyRoutes(app: FastifyInstance, pool: DbPool) {
 		const auth = request.auth
 		if (!['admin', 'manager'].includes(auth.role)) throw Errors.forbidden('Список приглашений — только админу/менеджеру')
 		const { rows } = await pool.query(
-			`select id, email, role, name, created_at from invitations
+			`select id, email, role, name, created_at, expires_at, accepted_at, revoked_at, requires_reissue from invitations
 			 where company_id = $1 order by created_at desc`,
 			[auth.companyId],
 		)
 		return {
 			invitations: rows.map(r => ({
-				id: r.id, email: r.email, role: r.role, name: r.name, createdAt: r.created_at,
+				id: r.id, email: r.email, role: r.role, name: r.name, createdAt: r.created_at, expiresAt:r.expires_at, acceptedAt:r.accepted_at, revokedAt:r.revoked_at, requiresReissue:r.requires_reissue,
 			})),
 		}
 	})
@@ -150,7 +127,7 @@ export function registerCompanyRoutes(app: FastifyInstance, pool: DbPool) {
 		if (!parsed.success) throw Errors.validation(parsed.error.issues)
 		// Матчим и id, и company_id — иначе кросс-компанийная отмена возможна.
 		const { rowCount } = await pool.query(
-			`delete from invitations where id = $1 and company_id = $2`,
+			`update invitations set revoked_at=coalesce(revoked_at,now()) where id=$1 and company_id=$2 and accepted_at is null`,
 			[parsed.data.id, auth.companyId],
 		)
 		if (!rowCount) throw Errors.notFound('Приглашение')
@@ -227,7 +204,7 @@ export function registerCompanyRoutes(app: FastifyInstance, pool: DbPool) {
 		return {
 			members: rows.map(r => ({
 				userId: r.user_id, email: r.email, role: r.role, name: r.name,
-				active: r.active, createdAt: r.created_at,
+				active: r.active, createdAt: r.created_at, expiresAt:r.expires_at, acceptedAt:r.accepted_at, revokedAt:r.revoked_at, requiresReissue:r.requires_reissue,
 			})),
 		}
 	})

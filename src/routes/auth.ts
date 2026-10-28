@@ -1,3 +1,4 @@
+import { acceptInvitation, InvitationSecret } from '../services/invitations.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { z } from 'zod'
@@ -17,7 +18,7 @@ const RegisterBody = z.object({
 	// B5-2 (ex F3-6): если пользователь перешёл по инвайт-ссылке с ?invite=<token>,
 	// клиент передаёт токен сюда. Если валидный и email совпадает с invitation.email,
 	// сразу создаём membership — не нужен отдельный /v1/invitations/accept.
-	inviteToken: z.string().min(8).max(200).optional(),
+	inviteToken: InvitationSecret.optional(),
 })
 
 const LoginBody = z.object({
@@ -109,30 +110,10 @@ export function registerAuthRoutes(
 				[email, passwordHash, name ?? null],
 			)
 			const user = inserted.rows[0]
-			// B5-2: если пришёл инвайт-токен — авто-accept внутри той же
-			// транзакции. Проверка email совпадает с invitation.email — защита
-			// от того, что кто-то стянул ссылку из чужой почты, но пробует
-			// зарегаться на своём. Без совпадения — просто игнорируем токен
-			// (клиент может дальше сделать /v1/invitations/accept вручную).
+			// Registration uses exactly the same one-time proof and transaction.
 			let acceptedCompanyId: string | null = null
-			if (inviteToken) {
-				const invRes = await client.query(
-					`select id, company_id, role, name, email from invitations
-					 where token = $1 for update`,
-					[inviteToken],
-				)
-				const inv = invRes.rows[0]
-				if (inv && inv.email.toLowerCase() === user.email.toLowerCase()) {
-					await client.query(
-						`insert into memberships (user_id, company_id, role, name)
-						 values ($1, $2, $3, $4)
-						 on conflict (user_id, company_id) do nothing`,
-						[user.id, inv.company_id, inv.role, inv.name ?? null],
-					)
-					await client.query(`delete from invitations where id = $1`, [inv.id])
-					acceptedCompanyId = inv.company_id
-				}
-			}
+            if (inviteToken) acceptedCompanyId = (await acceptInvitation(client,user.id,inviteToken)).companyId
+
 			const pair = await issueTokenPair(client, user, request)
 			return { user, pair, acceptedCompanyId }
 		})

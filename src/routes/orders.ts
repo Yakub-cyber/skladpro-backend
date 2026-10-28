@@ -1,13 +1,18 @@
+import { requireKnownRole, requirePermission, requireAssignedDelivery } from '../lib/permissions.js'
+import { cancellationV2 } from '../services/cancellationsV2.js'
+import { lockCustomerFinances } from '../services/customerFinance.js'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { DbPool } from '../db.js'
 import { withTransaction } from '../db.js'
-import { Errors, mapPgError } from '../lib/errors.js'
+import { ApiError, Errors, mapPgError } from '../lib/errors.js'
 import { publishEvent } from '../services/events.js'
-import { round4 } from '../lib/utils.js'
 import { claimIdempotencyKey, storeIdempotentResponse } from '../lib/idempotency.js'
 import { IdempotencyKey } from '../schemas/sale.js'
+import { CommercialBody, commercialError, saveCommercial } from '../services/orderCommercial.js'
+import { shipmentV2 } from '../services/shipmentsV2.js'
+import { deliveryV2 } from '../services/deliveriesV2.js'
 
 const StatusBody = z.object({
 	status: z.enum(['new', 'confirmed', 'picking', 'packed', 'shipped', 'delivered', 'cancelled']),
@@ -23,33 +28,103 @@ const TRANSITIONS: Record<string, string[]> = {
 	cancelled: [],
 }
 
-type OrderItem = { productId: string; qty: number; name?: string; cost?: number; price?: number }
-type ReturnEvent = { at: string; by: string; items: Array<{ productId: string; qty: number }> }
 
 export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
-	app.post('/v1/orders/:id/status', { preHandler: app.authenticate }, async (request, reply) => {
+ for (const operation of ['create','replace'] as const) {
+  app.route({ method: operation === 'create' ? 'POST' : 'PUT',
+   url: operation === 'create' ? '/v1/orders' : '/v1/orders/:id/commercial',
+   preHandler: app.authenticate, bodyLimit: 512 * 1024,
+   handler: async (request, reply) => {
+    requirePermission(request.auth.role, 'commercial')
+    const parsed = CommercialBody.safeParse(request.body)
+    if (!parsed.success) return commercialError('COMMERCIAL_INVALID','Некорректный коммерческий снимок',422)
+    const body = parsed.data
+    if ((operation === 'create' && body.expectedRowVersion !== undefined) ||
+      (operation === 'replace' && (!body.expectedRowVersion || (request.params as {id:string}).id !== body.orderId)))
+      commercialError('COMMERCIAL_INVALID','Некорректная версия или идентификатор заказа',422)
+    const result = await withTransaction(pool, client => saveCommercial(client,request.auth.companyId,operation,body))
+    if (result.replayed) reply.header('idempotency-replayed','true')
+    return reply.code(result.status).send(result.body)
+   },
+  })
+ }
+	app.post('/v1/orders/:id/status', { preHandler: app.authenticate, bodyLimit: 512 * 1024 }, async (request, reply) => {
 		const auth = request.auth
 		const orderId = (request.params as { id: string }).id
+        requireKnownRole(auth.role)
+        const target = (request.body as {status?:unknown}|null)?.status
+        if (target === 'cancelled') requirePermission(auth.role,'cancel')
+        else if (target === 'delivered') requirePermission(auth.role,'delivery')
+        else if (target === 'shipped' || target === 'picking' || target === 'packed') requirePermission(auth.role,'warehouse')
+        else requirePermission(auth.role,'commercial')
 
 		const keyParsed = IdempotencyKey.safeParse(request.headers['idempotency-key'])
 		if (!keyParsed.success) throw Errors.validation(keyParsed.error.issues)
 		const idemKey = keyParsed.data
 
+  const version = (request.body as {contractVersion?:unknown}|null)?.contractVersion
+  if (version !== undefined && version !== 1 && version !== 2)
+   throw new ApiError(422,'ORDER_STATUS_VERSION_UNSUPPORTED','Неизвестная версия изменения статуса')
+  if (version === 2) {
+   let result
+   try { result = (request.body as {status?:unknown}).status === 'cancelled'
+     ? await cancellationV2(pool,auth,orderId,request.body,idemKey)
+     : (request.body as {status?:unknown}).status === 'delivered'
+     ? await deliveryV2(pool,auth,orderId,request.body,idemKey)
+     : await shipmentV2(pool,auth,orderId,request.body,idemKey) }
+   catch (error) { throw error instanceof Error && 'statusCode' in error ? error : mapPgError(error,request.log) }
+   if (result.replayed) reply.header('idempotency-replayed','true')
+   if (!result.replayed) publishEvent(pool,{companyId:auth.companyId,type:'order_status',id:orderId,senderUserId:auth.userId})
+   return reply.code(result.status).send(result.body)
+  }
+
 		const parsed = StatusBody.safeParse(request.body)
 		if (!parsed.success) throw Errors.validation(parsed.error.issues)
 		const nextStatus = parsed.data.status
+        // Legacy shipment has no sufficient permanent command proof. Keep its
+        // former commercial-role requirement and deny before any transaction.
+        if (nextStatus === 'shipped') {
+          requirePermission(auth.role,'commercial')
+          const marker = (await pool.query('select commercial_snapshot from orders where company_id=$1 and id=$2 and deleted_at is null',[auth.companyId,orderId])).rows[0]
+          if (!marker) throw Errors.notFound(`Заказ ${orderId}`)
+          if (marker.commercial_snapshot)
+            commercialError('COMMERCIAL_ORDER_REQUIRES_SHIPMENT_V2','Защищённый заказ требует shipment v2')
+          // No temporary-key claim, workflow change, write fence or posting on this path.
+          throw new ApiError(422,'LEGACY_SHIPMENT_REQUIRES_RECONCILIATION','Legacy-отгрузка требует сверки; новое проведение запрещено')
+        }
+
+    // Gate protected legacy delivery/cancellation before temporary replay.
+    // This non-locking type check does not invert temp-key -> order locking.
+    if (nextStatus === 'cancelled') {
+      const marker = (await pool.query(`select commercial_snapshot,
+        exists(select 1 from order_commercial_commands c where c.company_id=$1 and c.order_id=orders.id) commercial_v2
+        from orders where company_id=$1 and id=$2`, [auth.companyId,orderId])).rows[0]
+      if (marker?.commercial_snapshot || marker?.commercial_v2)
+        commercialError('COMMERCIAL_ORDER_REQUIRES_CANCELLATION_V2', 'Защищённый заказ требует cancelled v2')
+    }
+    if (nextStatus === 'delivered' && (await pool.query('select commercial_snapshot from orders where company_id=$1 and id=$2', [auth.companyId, orderId])).rows[0]?.commercial_snapshot)
+      commercialError('COMMERCIAL_ORDER_REQUIRES_DELIVERY_V2', 'Защищённый заказ требует delivered v2')
 
 		const result = await withTransaction(pool, async client => {
+            if (auth.role === 'courier') {
+              const assigned=(await client.query('select assigned_to from orders where company_id=$1 and id=$2 and deleted_at is null',[auth.companyId,orderId])).rows[0]
+              await requireAssignedDelivery(client,auth,assigned?.assigned_to)
+            }
 			const claim = await claimIdempotencyKey(client, {
 				key: idemKey,
 				companyId: auth.companyId,
 				endpoint: `POST /v1/orders/status`,
 			})
-			if (claim.replay) return { status: claim.status, body: claim.response, replayed: true }
+			if (claim.replay) {
+    // A reused shipment key must not masquerade as a workflow-only replay.
+    if ((claim.response as {order?:{status?:unknown}}|null)?.order?.status === 'shipped')
+      throw new ApiError(422,'LEGACY_SHIPMENT_REQUIRES_RECONCILIATION','Историческая legacy-отгрузка требует сверки')
+    return { status: claim.status, body: claim.response, replayed: true }
+   }
 
 			const { rows } = await client.query(
 				`select id, no, status, stock_consumed, items, returns, assigned_to,
-				        on_credit, customer_id
+				        on_credit, customer_id, commercial_snapshot
 				 from orders
 				 where company_id = $1 and id = $2 and deleted_at is null
 				 for update`,
@@ -57,123 +132,48 @@ export function registerOrderRoutes(app: FastifyInstance, pool: DbPool) {
 			)
 			const order = rows[0]
 			if (!order) throw Errors.notFound(`Заказ ${orderId}`)
+   if (nextStatus === 'cancelled' && (order.commercial_snapshot || (await client.query('select 1 from order_commercial_commands where company_id=$1 and order_id=$2 limit 1',[auth.companyId,orderId])).rowCount))
+    commercialError('COMMERCIAL_ORDER_REQUIRES_CANCELLATION_V2','Защищённый заказ требует cancelled v2')
+   if (nextStatus === 'delivered' && order.commercial_snapshot)
+    commercialError('COMMERCIAL_ORDER_REQUIRES_DELIVERY_V2','Защищённый заказ требует delivered v2')
 
-			if (auth.role === 'courier') {
-				const isMine =
-					(!!auth.memberName && order.assigned_to === auth.memberName) ||
-					(!!order.assigned_to && order.assigned_to === auth.userId)
-				if (!(order.status === 'shipped' && nextStatus === 'delivered' && isMine))
-					throw Errors.forbidden('Курьер может только отметить доставку своего заказа')
-			}
+
+            if (auth.role === 'courier') {
+              await requireAssignedDelivery(client,auth,order.assigned_to)
+              if (!(order.status === 'shipped' && nextStatus === 'delivered')) throw Errors.forbidden('Курьер может только отметить доставку своего заказа')
+            }
 
 			const allowed = TRANSITIONS[order.status] ?? []
+			if (nextStatus === 'cancelled') {
+				const refunds = await client.query(
+					`select exists (select 1 from docs r where r.company_id=$1 and r.order_id=$2
+					 and r.doc_type in ('sales_return','retail_return') and (r.status='posted'
+					 or exists (select 1 from stock_movements m where m.company_id=$1 and m.doc_id=r.id)
+					 or exists (select 1 from money_movements m where m.company_id=$1 and m.doc_id=r.id)
+					 or exists (select 1 from settlement_movements m where m.company_id=$1 and m.doc_id=r.id))) as has_returns`,
+					[auth.companyId, orderId],
+				)
+				if (refunds.rows[0]?.has_returns) throw Errors.saleHasPostedReturns()
+   if (nextStatus === 'cancelled' && order.commercial_snapshot && (order.status === 'delivered' ||
+     (await client.query("select 1 from order_lifecycle_commands where company_id=$1 and order_id=$2 and operation='delivered' limit 1",[auth.companyId,orderId])).rowCount))
+    commercialError('DELIVERED_ORDER_CANCELLATION_FORBIDDEN','Доставленный защищённый заказ отменять нельзя; оформите возврат')
+			}
 			if (!allowed.includes(nextStatus))
 				throw Errors.validation([{ message: `Переход ${order.status} → ${nextStatus} запрещён` }])
 
-			const items: OrderItem[] = Array.isArray(order.items) ? order.items : []
+      if (nextStatus === 'cancelled' && order.stock_consumed) {
+        // Historical order/customer markers need not match document parties.
+        // Discover the complete set without document locks while holding the order.
+        const parties = nextStatus === 'cancelled' ? (await client.query(`select distinct party_id from docs
+          where company_id=$1 and order_id=$2 and status='posted'
+          and doc_type in ('sales_shipment','retail_receipt') and party_kind='customer'`, [auth.companyId,orderId])).rows : []
+        await lockCustomerFinances(client, auth.companyId, [order.customer_id === 'retail' ? null : order.customer_id, ...parties.map(p => p.party_id)])
+      }
+
 			const actor = auth.memberName ?? auth.email ?? auth.userId
-
-			// Склад по умолчанию
-			const { rows: whs } = await client.query(
-				`select id from warehouses where company_id = $1 and deleted_at is null order by id limit 1`,
-				[auth.companyId],
-			)
-			const warehouseId = whs[0]?.id ?? null
-
-			const isCredit = order.on_credit && order.customer_id && order.customer_id !== 'retail'
-			const hasParty = !!order.customer_id && order.customer_id !== 'retail'
-
-			const isRetail = !order.customer_id || order.customer_id === 'retail'
-
-			// shipped: создаём документ отгрузки
-			if (nextStatus === 'shipped' && !order.stock_consumed) {
-				const docId = `ship-${orderId}`
-				const docType = isRetail ? 'retail_receipt' : 'sales_shipment'
-
-				let accountId: string | null = null
-				if (!isCredit) {
-					const { rows: accs } = await client.query(
-						`select id from money_accounts where company_id = $1 and deleted_at is null order by is_default desc, id limit 1`,
-						[auth.companyId],
-					)
-					accountId = accs[0]?.id ?? null
-				}
-
-				await client.query(
-					`insert into docs (company_id, id, doc_type, warehouse_id, party_kind, party_id,
-					                   account_id, order_id, "by")
-					 values ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-					[
-						auth.companyId, docId, docType, warehouseId,
-						hasParty ? 'customer' : null,
-						hasParty ? order.customer_id : null,
-						accountId,
-						orderId,
-						actor,
-					],
-				)
-
-				const totals = new Map<string, { qty: number; price: number }>()
-				for (const it of items) {
-					if (!it?.productId) continue
-					const prev = totals.get(it.productId)
-					totals.set(it.productId, {
-						qty: round4((prev?.qty ?? 0) + Number(it.qty)),
-						price: prev?.price ?? (typeof it.price === 'number' ? it.price : 0),
-					})
-				}
-				const sorted = [...totals.entries()].sort(([a], [b]) => a.localeCompare(b))
-
-				for (const [i, [productId, { qty, price }]] of sorted.entries()) {
-					await client.query(
-						`insert into doc_lines (company_id, id, doc_id, line_no, product_id, unit_id, unit_factor,
-						                        qty_input, qty, price)
-						 values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-						[auth.companyId, `${docId}-${i}`, docId, i, productId, null, 1, qty, qty, price],
-					)
-				}
-
-				try {
-					await client.query('select post_doc($1,$2)', [auth.companyId, docId])
-				} catch (err) {
-					throw mapPgError(err, request.log)
-				}
-
-				// Наличная продажа реальному клиенту: гасим долг мгновенной оплатой
-				if (!isCredit && !isRetail) {
-					const orderTotal = [...totals.values()].reduce((s, t) => s + t.qty * t.price, 0)
-					const payDocId = `pay-${orderId}`
-					await client.query(
-						`insert into docs (company_id, id, doc_type, party_kind, party_id, account_id, amount, "by")
-						 values ($1,$2,'payment_in','customer',$3,$4,$5,$6)`,
-						[auth.companyId, payDocId, order.customer_id, accountId, Math.round(orderTotal * 100) / 100, actor],
-					)
-					try {
-						await client.query('select post_doc($1,$2)', [auth.companyId, payDocId])
-					} catch (err) {
-						throw mapPgError(err, request.log)
-					}
-				}
-
-				// stock_consumed + маркер серверного пути: клиент по shipment_doc_id
-				// понимает, что дальнейшие переходы (в т.ч. отмена) идут через
-				// этот эндпоинт, а не через sync/push.
-				await client.query(
-					`update orders set stock_consumed = true, shipment_doc_id = $3
-					 where company_id = $1 and id = $2`,
-					[auth.companyId, orderId, docId],
-				)
-			}
 
 			// cancelled после отгрузки: распроводим все документы по этому заказу
 			if (nextStatus === 'cancelled' && order.stock_consumed) {
-				const returnedByProduct = new Map<string, number>()
-				for (const ev of (order.returns ?? []) as ReturnEvent[]) {
-					for (const it of ev.items ?? []) {
-						returnedByProduct.set(it.productId, (returnedByProduct.get(it.productId) ?? 0) + Number(it.qty))
-					}
-				}
-
 				const { rows: docRows } = await client.query(
 					`select id from docs
 					 where company_id = $1 and order_id = $2 and status = 'posted'

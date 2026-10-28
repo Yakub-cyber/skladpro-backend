@@ -15,7 +15,7 @@ describe('admin: приглашения', () => {
 		const now = new Date().toISOString()
 		const { app } = await makeTestApp({
 			handler: sql => {
-				if (sql.startsWith('select id, email, role, name, created_at from invitations'))
+				if (sql.startsWith('select id, email, role, name, created_at,'))
 					return [{ id: 'i1', email: 'x@t.ru', role: 'stock', name: null, created_at: now }]
 				return undefined
 			},
@@ -38,7 +38,7 @@ describe('admin: приглашения', () => {
 		let deletedParams: unknown[] = []
 		const { app } = await makeTestApp({
 			handler: (sql, params) => {
-				if (sql.startsWith('delete from invitations where id')) {
+				if (sql.startsWith('update invitations set revoked_at')) {
 					deletedParams = params
 					return [{ id: params[0] }] // rowCount 1
 				}
@@ -56,7 +56,7 @@ describe('admin: приглашения', () => {
 
 	it('DELETE /v1/invitations/:id — несуществующее → 404', async () => {
 		const { app } = await makeTestApp({
-			handler: sql => (sql.startsWith('delete from invitations') ? [] : undefined),
+			handler: sql => (sql.startsWith('update invitations set revoked_at') ? [] : undefined),
 		})
 		const res = await app.inject({
 			method: 'DELETE',

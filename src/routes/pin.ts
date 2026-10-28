@@ -39,8 +39,8 @@ export function registerPinRoutes(app: FastifyInstance, pool: DbPool) {
 		const auth = request.auth
 		const parsed = EnsureMeBody.safeParse(request.body)
 		if (!parsed.success) throw Errors.validation(parsed.error.issues)
-		const { id, name, role } = parsed.data
-		const effectiveRole = role ?? auth.role ?? 'admin'
+		const { id, name } = parsed.data
+		const effectiveRole = auth.role
 
 		// Если user уже привязан к сотруднику (после предыдущего bootstrap) —
 		// обновляем имя и возвращаем. Не создаём второго.
@@ -52,12 +52,13 @@ export function registerPinRoutes(app: FastifyInstance, pool: DbPool) {
 		)
 		if (existing.rows.length > 0) {
 			const emp = existing.rows[0]
-			if (emp.name !== name) {
+			if (emp.name !== name || emp.role !== effectiveRole) {
 				await pool.query(
-					`update employees set name = $3 where company_id = $1 and id = $2`,
-					[auth.companyId, emp.id, name],
+					`update employees set name=$3, role=$4 where company_id=$1 and id=$2`,
+					[auth.companyId, emp.id, name, effectiveRole],
 				)
 				emp.name = name
+                emp.role = effectiveRole
 			}
 			reply.code(200)
 			return { ok: true, employee: emp }
@@ -69,10 +70,13 @@ export function registerPinRoutes(app: FastifyInstance, pool: DbPool) {
 			 on conflict (company_id, id) do update
 			   set user_id = excluded.user_id,
 			       name = excluded.name,
-			       deleted_at = null
+			       deleted_at = null,
+                   role = excluded.role
+               where employees.user_id = excluded.user_id
 			 returning id, name, role, user_id`,
 			[auth.companyId, id, name, effectiveRole, auth.userId],
 		)
+		if (!rows[0]) throw Errors.forbidden('Сотрудник уже связан с другой учётной записью')
 		reply.code(200)
 		return { ok: true, employee: rows[0] }
 	})

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { authHeaders, COMPANY_ID, coreHandler, makeTestApp } from './helpers.js'
+import { authHeaders, COMPANY_ID, USER_ID, coreHandler, makeTestApp } from './helpers.js'
 
 type OrderRow = {
 	id: string
@@ -17,6 +17,9 @@ type OrderRow = {
 function handlerWith(order: OrderRow, postDocOpts?: Parameters<typeof coreHandler>[0]) {
 	const core = coreHandler(postDocOpts)
 	return (sql: string, params: unknown[]): unknown[] | undefined => {
+		if (sql.includes('select commercial_snapshot from orders')) return params[1] === order.id ? [order] : []
+		if (sql.includes('select assigned_to from orders')) return params[1] === order.id ? [order] : []
+        if (sql.includes('select distinct m.user_id from memberships')) return params[1] === 'Вася' || params[1] === USER_ID ? [{user_id:USER_ID}] : []
 		if (sql.includes('from orders') && sql.includes('for update'))
 			return params[1] === order.id ? [order] : []
 		const c = core(sql, params)
@@ -31,7 +34,7 @@ function handlerWith(order: OrderRow, postDocOpts?: Parameters<typeof coreHandle
 describe('POST /v1/orders/:id/status', () => {
 	const items = [{ productId: 'p-1', qty: 2, name: 'Товар', price: 100 }]
 
-	it('shipped: создаёт doc + doc_lines + post_doc, ставит stock_consumed', async () => {
+	it('legacy shipped: 422 before keys, documents or stock changes', async () => {
 		const { app, log } = await makeTestApp({
 			handler: handlerWith({ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items }),
 		})
@@ -41,15 +44,12 @@ describe('POST /v1/orders/:id/status', () => {
 			headers: await authHeaders({ 'idempotency-key': 'status-test-0001' }),
 			payload: { status: 'shipped' },
 		})
-		expect(res.statusCode).toBe(200)
-		const sqls = log.map(e => e.sql)
-		expect(sqls.some(s => s.includes('insert into docs'))).toBe(true)
-		expect(sqls.some(s => s.includes('insert into doc_lines'))).toBe(true)
-		expect(sqls.some(s => s.includes('post_doc'))).toBe(true)
-		expect(sqls.some(s => s.includes('set stock_consumed = true'))).toBe(true)
+		expect(res.statusCode).toBe(422)
+		expect(res.json().error.code).toBe('LEGACY_SHIPMENT_REQUIRES_RECONCILIATION')
+		expect(log.some(e => /insert into|update orders|post_doc|begin/.test(e.sql))).toBe(false)
 	})
 
-	it('shipped при нехватке остатка → post_doc бросает P0001 → 409', async () => {
+	it('legacy shipped does not reach post_doc, including insufficient-stock orders', async () => {
 		const { app } = await makeTestApp({
 			handler: handlerWith(
 				{ id: 'o-1', no: '1', status: 'packed', stock_consumed: false, items },
@@ -62,8 +62,8 @@ describe('POST /v1/orders/:id/status', () => {
 			headers: await authHeaders({ 'idempotency-key': 'status-test-0002' }),
 			payload: { status: 'shipped' },
 		})
-		expect(res.statusCode).toBe(409)
-		expect(res.json().error.code).toBe('INSUFFICIENT_STOCK')
+		expect(res.statusCode).toBe(422)
+		expect(res.json().error.code).toBe('LEGACY_SHIPMENT_REQUIRES_RECONCILIATION')
 	})
 
 	it('cancelled после отгрузки: находит docs + unpost_doc', async () => {

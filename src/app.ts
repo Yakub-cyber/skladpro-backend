@@ -38,6 +38,7 @@ import { registerSalesRoutes } from './routes/sales.js'
 import { registerSubscriptionRoutes } from './routes/subscription.js'
 import { registerSupportRoutes } from './routes/support.js'
 import { registerSyncRoutes } from './routes/sync.js'
+import { registerStockRoutes } from './routes/stock.js'
 import { registerWebhookRoutes } from './routes/webhooks.js'
 import { registerTrackRoutes, registerFeatureUsageAdminRoutes } from './routes/track.js'
 
@@ -66,7 +67,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 	const app = Fastify({
 		logger: {
 			level: config.NODE_ENV === 'test' ? 'silent' : 'info',
-			redact: ['req.headers.authorization', 'req.headers["idempotency-key"]'],
+			redact: ['req.headers.authorization', 'req.headers["idempotency-key"]', 'req.body.token', 'req.body.inviteToken', 'res.body.token'],
 		},
 		genReqId: (req) => (req.headers['x-trace-id'] as string) || randomUUID(),
 		trustProxy: config.TRUST_PROXY,
@@ -100,9 +101,9 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 			if (auth?.userId) return `u:${auth.userId}`
 			return req.ip
 		},
-		errorResponseBuilder: () => ({
-			error: { code: 'RATE_LIMITED', message: 'Слишком много запросов, попробуйте позже' },
-		}),
+		// Preserve the limiter's HTTP status through the shared error handler.
+		errorResponseBuilder: (_request, context) =>
+			new ApiError(context.statusCode, 'RATE_LIMITED', 'Слишком много запросов, попробуйте позже'),
 	})
 
 	app.setErrorHandler((err, request, reply) => {
@@ -158,6 +159,7 @@ export async function buildApp(opts: BuildAppOptions): Promise<FastifyInstance> 
 	registerAuthRoutes(app, { pool, tokens, mailer, config })
 	registerCompanyRoutes(app, pool)
 	registerSyncRoutes(app, pool)
+	registerStockRoutes(app, pool)
 	registerSalesRoutes(app, pool)
 	registerDocumentRoutes(app, pool)
 	registerOrderRoutes(app, pool)

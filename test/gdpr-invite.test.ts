@@ -217,9 +217,10 @@ describe('B5-2: inviteToken в register', () => {
 				return [{ id: USER_ID, email: params[0], name: params[2] }]
 			}
 			if (sql.includes('insert into refresh_tokens')) return []
-			if (sql.includes('from invitations where token')) {
+            if (sql.includes('select email from users')) return [{email:params[0] === USER_ID ? 'invited@company.ru' : 'unknown@example.test'}]
+			if (sql.includes('from invitations where secret_hash')) {
 				return [{
-					id: 'inv-1',
+					id: 'inv-1', expires_at:new Date(Date.now()+86400000),
 					company_id: COMPANY_ID,
 					role: 'manager',
 					name: 'Приглашённый',
@@ -243,7 +244,7 @@ describe('B5-2: inviteToken в register', () => {
 				email: 'invited@company.ru',
 				password: 'strong-pass-12',
 				name: 'Новый',
-				inviteToken: 'token-abc-xyz-32chars',
+				inviteToken: 'a'.repeat(32),
 			},
 		})
 		expect(res.statusCode).toBe(201)
@@ -251,7 +252,7 @@ describe('B5-2: inviteToken в register', () => {
 		expect(seenSql.some(s => s.includes('insert into memberships'))).toBe(true)
 	})
 
-	it('токен корректный, но email НЕ совпадает → нет auto-accept', async () => {
+	it('токен корректный, но email НЕ совпадает → отказ и rollback', async () => {
 		const seenSql: string[] = []
 		const { pool } = makeFakePool((sql, params) => {
 			seenSql.push(sql)
@@ -259,9 +260,10 @@ describe('B5-2: inviteToken в register', () => {
 				return [{ id: USER_ID, email: params[0], name: params[2] }]
 			}
 			if (sql.includes('insert into refresh_tokens')) return []
-			if (sql.includes('from invitations where token')) {
+            if (sql.includes('select email from users')) return [{email:params[0] === USER_ID ? 'invited@company.ru' : 'unknown@example.test'}]
+			if (sql.includes('from invitations where secret_hash')) {
 				return [{
-					id: 'inv-1',
+					id: 'inv-1', expires_at:new Date(Date.now()+86400000),
 					company_id: COMPANY_ID,
 					role: 'manager',
 					email: 'ORIGINAL@company.ru',  // не совпадает
@@ -277,10 +279,10 @@ describe('B5-2: inviteToken в register', () => {
 			payload: {
 				email: 'attacker@evil.ru',
 				password: 'strong-pass-12',
-				inviteToken: 'stolen-token',
+				inviteToken: 'b'.repeat(32),
 			},
 		})
-		expect(res.statusCode).toBe(201)
+		expect(res.statusCode).toBe(403)
 		expect(seenSql.some(s => s.includes('insert into memberships'))).toBe(false)
 	})
 
@@ -305,7 +307,7 @@ describe('B5-2: inviteToken в register', () => {
 			},
 		})
 		expect(res.statusCode).toBe(201)
-		expect(seenSql.some(s => s.includes('from invitations where token'))).toBe(false)
+		expect(seenSql.some(s => s.includes('from invitations where secret_hash'))).toBe(false)
 	})
 })
 

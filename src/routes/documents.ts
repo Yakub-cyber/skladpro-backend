@@ -1,3 +1,4 @@
+import { requirePermission } from '../lib/permissions.js'
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
@@ -45,7 +46,7 @@ const DocumentBody = z.object({
 export function registerDocumentRoutes(app: FastifyInstance, pool: DbPool) {
 	app.post('/v1/documents/post', { preHandler: app.authenticate }, async (request, reply) => {
 		const auth = request.auth
-		if (auth.role === 'courier') throw Errors.forbidden('Курьеру проводка недоступна')
+		requirePermission(auth.role, 'warehouse')
 
 		const keyParsed = IdempotencyKey.safeParse(request.headers['idempotency-key'])
 		if (!keyParsed.success) throw Errors.validation(keyParsed.error.issues)

@@ -1,3 +1,4 @@
+import { legacyCustomerFixture } from './legacy-customer-fixture.js'
 import { randomUUID } from 'node:crypto'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { call, cash, costAt, debt, drift, hasDb, allowSkipIntegration, setupIntegration, stockAt, type Ctx } from './helpers.js'
@@ -57,10 +58,10 @@ describe.skipIf(!hasDb)('учётное ядро на живой базе', () =
 		expect(Number(rows[0].cost_amount)).toBe(600) // 20 шт × 30
 	})
 
-	it('оплата гасит долг и кладёт деньги в кассу', async () => {
-		const res = await call(ctx, 'POST', `/v1/customers/${ctx.ids.customer}/payments`, {
+	it('исторический payment fixture гасит долг и кладёт деньги в кассу', async () => {
+		const res = await legacyCustomerFixture(ctx, {
 			amount: 600, kind: 'payment',
-		})
+		}, undefined, ctx.ids.customer)
 		expect(res.statusCode).toBeLessThan(300)
 
 		expect(await debt(ctx, 'customer', ctx.ids.customer)).toBe(400)

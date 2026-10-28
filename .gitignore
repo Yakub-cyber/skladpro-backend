@@ -13,3 +13,20 @@ credentials/
 *.pem
 *.key
 firebase-admin*.json
+
+# Local release archives and database backups (never publish).
+/*.tar.gz
+/*.dump
+
+# One-off local database tools; retained locally pending security review.
+/scripts/check-retail.mjs
+/scripts/dedupe-employees.sql
+/scripts/fix-docs-check.mjs
+/scripts/fix-migration.mjs
+/scripts/recreate-test-db.mjs
+/scripts/setup-test-db.mjs
+/scripts/setup-test-db2.mjs
+/scripts/setup-test-db3.mjs
+/scripts/setup-test-db4.mjs
+/scripts/setup-test-db5.mjs
+/scripts/verify-sale-cycle.sql
